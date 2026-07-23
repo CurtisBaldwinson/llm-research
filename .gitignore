@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+._*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Experiment artifacts (regenerated; not source)
+lab_reports/*.json
+results/
+*.log
+
+# Model / data caches
+*.pt
+*.bin
+*.safetensors
+data/

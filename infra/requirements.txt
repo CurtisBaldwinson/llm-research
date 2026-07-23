@@ -1,0 +1,24 @@
+# Dependencies for the multi-cloud dispatcher + remote-finalize pipeline.
+#
+# Installed into scripts/.venv by `make scripts-venv`.  Kept minimal so
+# the dispatcher's surface area stays small and auditable.
+#
+# Crypto stack: synth_crypto.py uses these for hybrid PQ encryption of
+# remote run results (X25519 + ML-KEM-768 + ChaCha20-Poly1305).
+cryptography>=42.0,<49.0
+pqcrypto>=0.4.0,<0.5.0
+
+# Backblaze B2 client.  rclone is preferred for the pod-side upload
+# (single static binary, no Python deps), but the official b2-sdk-python
+# is used on the local side to list bucket contents during reattach.
+b2sdk>=2.0,<3.0
+
+# Unique-by-construction staging-dir suffixes (adjective-noun slugs like
+# `serene-dragon`).  Used by run_on_cloud.py to avoid the second-resolution
+# timestamp collision that bit the 2026-05-26 PP20 watcher (multiple
+# dispatchers in the same UTC second silently shared one staging dir
+# under mkdir(exist_ok=True)).  Pure Python, ~10^7 unique slug pairs.
+coolname>=2.2,<3.0
+
+# Testing.
+pytest>=8.0,<9.0
