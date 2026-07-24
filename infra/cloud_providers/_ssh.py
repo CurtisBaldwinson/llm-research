@@ -636,6 +636,13 @@ touch "$RESULTS_DIR/_FINISHED.$FINISHED_UTC"
 # the 2026-05-18 RunPod failure).
 sync || true
 
+# CRITICAL: disable xtrace before remote-finalize.  The finalize block
+# sources a secrets env file; with ``set -x`` still on, bash prints
+# ``export RUNPOD_API_KEY=...`` / B2 keys into run.log, which is then
+# tarred, encrypted to B2, and pulled locally — secret exfiltration via
+# the success path.  (Caught 2026-07-24 smoke: eager-grasshopper.)
+set +x
+
 {finalize_block}
 
 exit $RC
@@ -695,7 +702,11 @@ if [ "$RC" = "0" ] \\
         && [ -f "{REMOTE_FINALIZE_DIR}/synth-results.pub" ] \\
         && [ -f "{secrets_path}" ]; then
     echo "[wrapper] remote-finalize: invoking pod_finalize.py"
+    # Subshell: set +x again (belt-and-suspenders), source secrets without
+    # xtrace, scrub env file, run finalize.  Never re-enable xtrace here.
     (
+        set +x
+        set +v
         set -a
         # shellcheck disable=SC1090
         . "{secrets_path}"
