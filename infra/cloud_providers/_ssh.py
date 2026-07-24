@@ -371,8 +371,8 @@ def push_finalize_payload(
     locally -- the dispatcher uses this to fail fast rather than launch a
     run that would silently lose its remote-finalize capability.
     """
-    sc_path = project_root / "scripts" / "synth_crypto.py"
-    pf_path = project_root / "scripts" / "pod_finalize.py"
+    sc_path = project_root / "infra" / "synth_crypto.py"
+    pf_path = project_root / "infra" / "pod_finalize.py"
     pk_path = pubkey_path.expanduser().resolve()
 
     for label, p in [("synth_crypto.py", sc_path),
@@ -476,7 +476,7 @@ def build_remote_wrapper(
         '  echo "    [pip] installing from $req (skipping torch)"; '
         "  grep -v -E '^[[:space:]]*torch([[:space:]]|==|>=|<=|~=|!=|$)' \"$req\" "
         "    | grep -v -E '^[[:space:]]*(#|$)' "
-        "    | xargs -r pip install --quiet --no-cache-dir; "
+        "    | xargs -r \"$PYBIN\" -m pip install --quiet --no-cache-dir; "
         "fi; "
         "done"
     )
@@ -510,7 +510,70 @@ echo "[wrapper] starting at $STARTED_UTC"
 echo "[wrapper] benchmark={benchmark} smoke={'1' if smoke else '0'}"
 echo "[wrapper] PID=$$"
 
-python3 -c "import torch; assert torch.cuda.is_available(), 'CUDA not detected'; print('CUDA OK:', torch.cuda.get_device_name(0))" || {{
+# --- resolve a Python interpreter that actually has torch --------------------
+# RunPod's newer images (1.0.x-rc scheme) install PyTorch into a venv
+# (/venv) rather than system Python, and a non-login nohup shell never sources
+# the activation hook -- so bare `python3` has no torch. Probe the known venv
+# locations first, then any activate script, then fall back to python3. This
+# keeps working on the old system-Python images too.
+PYBIN=""
+# Probe is FAST and LOUD: we echo before each step (so the log never looks
+# frozen) and wrap every torch import in `timeout` (a first torch import on a
+# fresh image can take 30-60s while CUDA libs load; without a cap a bad
+# candidate could hang the whole wrapper). We deliberately do NOT scan the
+# whole filesystem -- a `find /` on these 12GB images pins IO for minutes and
+# gets the pod reaped before we ever print anything.
+torch_ok() {{ timeout 90 "$1" -c "import torch" >/dev/null 2>&1; }}
+echo "[wrapper] resolving python w/ torch (PATH=$PATH)"
+# KNOWN-GOOD FAST PATH: on the runpod/pytorch:1.0.7-rc.* images, torch is
+# installed into the OS python at /usr/bin/python3 (verified on a live pod:
+# `/usr/bin/python3 -c "import torch"` -> 2.4.1+cu124). NOTE the tag is
+# effectively rolling -- a different pull showed torch 2.9.1 at
+# /usr/local/bin/python -- so we check /usr/bin/python3 first, then fall back
+# to a broad candidate scan. This short-circuit avoids slow multi-candidate
+# probing that can stall under IO pressure on a fresh image.
+if [ -x /usr/bin/python3 ] && torch_ok /usr/bin/python3; then
+    PYBIN=/usr/bin/python3
+    echo "[wrapper] fast-path hit: PYBIN=$PYBIN"
+fi
+# 1) Fallback: check a small, deterministic candidate set (skipped if fast
+#    path hit). Order: OS python, PATH python, then venv/conda layouts.
+if [ -z "$PYBIN" ]; then
+for cand in /usr/bin/python3 python3 python /usr/local/bin/python /usr/local/bin/python3 \
+            /venv/bin/python /venv/bin/python3 \
+            /opt/conda/bin/python /workspace/venv/bin/python; do
+    command -v "$cand" >/dev/null 2>&1 || continue
+    echo "[wrapper]   trying $cand ..."
+    if torch_ok "$cand"; then PYBIN="$(command -v "$cand")"; break; fi
+done
+fi
+# 2) Bounded fallback: a SHALLOW, time-capped find for torch's site-packages,
+#    restricted to the dirs images actually use (never a full-disk walk).
+if [ -z "$PYBIN" ]; then
+    echo "[wrapper]   candidates failed; bounded search for torch site-packages ..."
+    tp="$(timeout 60 find /usr/local/lib /usr/lib /opt /venv /workspace -maxdepth 6 \
+              -type d -name torch -path "*site-packages*" 2>/dev/null | head -1)"
+    if [ -n "$tp" ]; then
+        echo "[wrapper]   found torch at $tp"
+        envroot="${{tp%/lib/*}}"
+        for p in "$envroot"/bin/python "$envroot"/bin/python3 "$envroot"/bin/python3.*; do
+            [ -x "$p" ] && torch_ok "$p" && {{ PYBIN="$p"; break; }}
+        done
+    fi
+fi
+if [ -z "$PYBIN" ]; then
+    echo "[wrapper] FATAL: no Python with torch found. Image layout:" >&2
+    echo "[diag] PATH=$PATH" >&2
+    which -a python python3 2>&1 | sed "s/^/[diag] which: /" >&2
+    ls -la /venv /workspace /opt/conda 2>&1 | sed "s/^/[diag] ls: /" >&2
+    timeout 45 find /usr/local/lib /usr/lib /opt /venv -maxdepth 6 -type d -name torch -path "*site-packages*" 2>/dev/null | sed "s/^/[diag] torch: /" >&2
+    echo 999 > "$RESULTS_DIR/_DONE.999"
+    exit 999
+fi
+
+echo "[wrapper] using PYBIN=$PYBIN ($("$PYBIN" -c 'import torch,sys;print(torch.__version__, "cuda", torch.version.cuda)' 2>/dev/null))"
+
+"$PYBIN" -c "import torch; assert torch.cuda.is_available(), 'CUDA not detected'; print('CUDA OK:', torch.cuda.get_device_name(0))" || {{
     echo 999 > "$RESULTS_DIR/_DONE.999"
     exit 999
 }}
@@ -532,7 +595,7 @@ echo "[wrapper] entry=$ENTRY  smoke_flag={smoke_flag!r}  extra_args={extra_args!
 # stdbuf -oL -eL: line-buffer libc-level streams.
 # Both layers together ensure each `print(..., flush=True)` is on disk
 # by the time the next line of Python executes.
-stdbuf -oL -eL python3 -u "$ENTRY" {smoke_flag} {extra_args}
+stdbuf -oL -eL "$PYBIN" -u "$ENTRY" {smoke_flag} {extra_args}
 RC=$?
 FINISHED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # Trace the trailing exit-path commands.  xtrace output goes to stderr,
@@ -641,7 +704,7 @@ if [ "$RC" = "0" ] \\
         # explicit forward, pod_finalize.py would FATAL on the env-var
         # check and the pod would never self-terminate.
         export RUNPOD_POD_ID={pod_id}
-        python3 "{REMOTE_FINALIZE_DIR}/pod_finalize.py" \\
+        "$PYBIN" "{REMOTE_FINALIZE_DIR}/pod_finalize.py" \\
             --results-dir "$RESULTS_DIR" \\
             --recipient-pubkey "{REMOTE_FINALIZE_DIR}/synth-results.pub" \\
             --bench '{benchmark}' \\

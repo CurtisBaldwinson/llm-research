@@ -1,0 +1,20 @@
+# Experiment 1 (TRACE) — real-run dependencies.
+#
+# scripts/run_on_runpod.py filters `torch` out of every requirements.txt
+# before pip-installing, so torch is NOT pinned here (the image's
+# CUDA-matched build stays). See v1 LESSONS_LEARNED L-025.
+
+transformers>=4.40.0,<4.55
+datasets>=2.18.0,<4.0
+numpy>=1.26.0
+peft>=0.10,<0.13
+accelerate>=0.30,<1.0
+
+# metrics for the generation tasks (ROUGE-L / SARI) at report time
+rouge-score>=0.1.2
+sacrebleu>=2.3.0
+
+# TRACE data staging on the pod (fetch_data.stage_trace pulls the official
+# Google Drive release). Pinned here so the wrapper's install loop provisions
+# it upfront rather than fetch_data doing a runtime pip during sequence build.
+gdown>=5.1.0

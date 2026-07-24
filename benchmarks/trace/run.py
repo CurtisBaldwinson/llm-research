@@ -32,16 +32,30 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List
 
-ROOT = Path(__file__).resolve().parents[2]   # Synthetic2/
-for p in (ROOT, ROOT / "sm_core"):
-    if str(p) not in sys.path:
+# Local layout:  benchmarks/trace/            -> two levels up to Synthetic2/, sm_src sibling there.
+# Remote layout: /workspace/synth/trace/      -> one level up to /workspace/synth/, sm_src sibling there
+#                (the GPU dispatcher lays sm_src + the benchmark dir side-by-side under REMOTE_BASE).
+# eval/ and baselines/ are VENDORED into this benchmark dir so they travel with
+# it when the GPU dispatcher tar-pushes benchmarks/<bench>/ to the pod (the
+# dispatcher pushes only sm_src/ + the benchmark dir). Adding this dir to the
+# path makes the vendored packages import as top-level modules, identically
+# whether run locally (benchmarks/trace/) or on the pod (cd REMOTE_BASE/trace).
+HERE = Path(__file__).resolve().parent            # benchmarks/trace  (local) or REMOTE_BASE/trace (remote)
+ROOT = Path(__file__).resolve().parents[2]        # Synthetic2/       (local only)
+BENCH_PARENT = Path(__file__).resolve().parents[1]  # benchmarks/ (local) or REMOTE_BASE/ (remote)
+_candidates = [
+    HERE,                           # vendored eval/ + baselines/ + trace_data + arms_mechanism
+    ROOT / "sm_src",                # local:  Synthetic2/sm_src
+    BENCH_PARENT / "sm_src",        # remote: REMOTE_BASE/sm_src
+    ROOT,                           # local:  project root (harmless if absent remotely)
+]
+for p in _candidates:
+    if p.exists() and str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
 from eval.metrics import summarize, mean_std, exceeds_2sigma        # noqa: E402
 from baselines import ARM_REGISTRY as BASELINE_ARMS                 # noqa: E402
-from benchmarks.trace.arms_mechanism import (                       # noqa: E402
-    ARM_REGISTRY as MECH_ARMS,
-)
+from arms_mechanism import ARM_REGISTRY as MECH_ARMS               # noqa: E402
 
 ALL_ARMS = {**BASELINE_ARMS, **MECH_ARMS}
 
@@ -63,16 +77,18 @@ DEFAULT_SEEDS = [0, 1, 2, 3, 4]   # n>=5 per README
 # Task sequence abstraction
 # ---------------------------------------------------------------------------
 
-def build_task_sequence(mode: str, tokenizer=None, n_tasks: int = 5, seed: int = 0):
+def build_task_sequence(mode: str, tokenizer=None, n_tasks: int = 5, seed: int = 0,
+                        data_root=None, batch_size: int = 8, max_len: int = 512):
     """Return a list of tasks; each task = (train_loader, eval_loader).
 
     smoke: synthetic permuted-token sequences (self-contained, CPU-safe).
-    trace: real TRACE splits (loaded lazily; requires datasets + GPU model).
+    trace: the real 8-task TRACE sequence in canonical order.
     """
     if mode == "smoke":
         return _synthetic_sequence(n_tasks=n_tasks, seed=seed)
     elif mode == "trace":
-        return _trace_sequence(tokenizer=tokenizer, seed=seed)
+        return _trace_sequence(tokenizer=tokenizer, data_root=data_root,
+                               batch_size=batch_size, max_len=max_len)
     raise ValueError(f"unknown mode {mode!r}")
 
 
@@ -109,12 +125,35 @@ def _synthetic_sequence(n_tasks: int, seed: int, vocab: int = 64,
     return [make_task(t) for t in range(n_tasks)]
 
 
-def _trace_sequence(tokenizer, seed: int):
-    """Real TRACE task sequence. Lazy import; only used on the GPU run."""
-    raise NotImplementedError(
-        "TRACE loader is wired on the GPU dispatch path (infra/). The smoke "
-        "path exercises the full harness logic without downloads. See "
-        "README 'Experiment Scope' and infra/run_on_cloud.py."
+def _trace_sequence(tokenizer, data_root, batch_size: int = 8, max_len: int = 512):
+    """Real 8-task TRACE sequence via the official JSON task folders.
+
+    Stages the official TRACE archive on first use (idempotent). On the pod the
+    data isn't shipped in the code tar -- fetch_data.stage_trace() pulls it from
+    the official Google Drive release and normalizes it under <data_root>.
+    """
+    from pathlib import Path
+    from trace_data import build_trace_sequence
+    from fetch_data import stage_trace
+    if tokenizer is None:
+        raise ValueError("trace mode requires a tokenizer")
+    if data_root is None:
+        # Default to a data/ dir NEXT TO this benchmark (HERE/data/TRACE), which
+        # is writable both locally (benchmarks/trace/data) and on the pod
+        # (REMOTE_BASE/trace/data). ROOT/parents[2] is unreliable on the pod.
+        data_root = HERE / "data" / "TRACE"
+    data_root = Path(data_root)
+    # Idempotent fetch-on-pod (and locally if absent); fails loud on network error.
+    # stage_trace() appends its own TRACE/ segment and returns the real staged
+    # dir (…/TRACE). build_trace_sequence() reads <root>/<task> directly, so it
+    # must receive that returned path, NOT the pre-stage data_root (otherwise the
+    # TRACE segment is doubled: data/TRACE/TRACE vs the expected data/TRACE).
+    staged_root = stage_trace(data_root)
+    return build_trace_sequence(
+        tokenizer=tokenizer,
+        data_root=staged_root,
+        batch_size=batch_size,
+        max_len=max_len,
     )
 
 
@@ -132,7 +171,7 @@ def build_model(mode: str, vocab: int = 64):
             """Minimal GPT-ish LM: embed -> 1 linear block -> tie head.
 
             Exposes the HF-style forward(input_ids, labels=...) -> .loss/.logits
-            interface the sm_core hooks and Fisher estimator expect.
+            interface the sm_src hooks and Fisher estimator expect.
             """
             def __init__(self, vocab, d=32):
                 super().__init__()
@@ -158,7 +197,10 @@ def build_model(mode: str, vocab: int = 64):
 
         return TinyLM(vocab)
 
-    raise NotImplementedError("trace model build is on the GPU dispatch path")
+    raise NotImplementedError(
+        "For trace mode call build_real_model() in trace_data.py directly; "
+        "the orchestrator wires model + tokenizer together (see run())."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -227,22 +269,107 @@ def run_arm_over_sequence(arm, model, sequence, lr: float, epochs: int) -> Dict:
 # ---------------------------------------------------------------------------
 
 def run(mode: str, arms: List[str], seeds: List[int], lambdas: List[float],
-        n_tasks: int, lr: float, epochs: int) -> Dict:
+        n_tasks: int, lr: float, epochs: int,
+        model_id: str = None, data_root=None,
+        batch_size: int = 8, max_len: int = 512, ckpt_dir=None) -> Dict:
+    """Run the arms x seeds x lambdas matrix.
+
+    Robustness (added 2026-07-24):
+      1. Model + data built ONCE; pristine weights snapshotted to CPU and
+         restored before each cell (was: full 3B reload per cell, 175x).
+      2. Each completed cell checkpointed immediately to
+         ckpt_dir/cell_<lam>_<arm>_<seed>.json + progress.jsonl, so an
+         interrupted run loses at most the in-flight cell (was: lost all).
+      3. On restart, checkpointed cells are loaded and skipped (resume).
+         Flushed per-cell progress prints give live timing.
+    """
+    import copy
+    import time
     import torch
 
     results = {a: {"lambda_runs": {}} for a in arms}
+
+    ckpt_path = Path(ckpt_dir) if ckpt_dir else None
+    if ckpt_path:
+        ckpt_path.mkdir(parents=True, exist_ok=True)
+        progress_log = ckpt_path / "progress.jsonl"
+    else:
+        progress_log = None
+
+    def _cell_file(lam, arm_name, seed):
+        return ckpt_path / f"cell_{lam}_{arm_name}_{seed}.json" if ckpt_path else None
+
+    def _load_cell(lam, arm_name, seed):
+        f = _cell_file(lam, arm_name, seed)
+        if f and f.exists():
+            try:
+                return json.loads(f.read_text())
+            except Exception:
+                return None
+        return None
+
+    # ---- FIX 2: build model + data ONCE -----------------------------------
+    if mode == "trace":
+        from trace_data import build_real_model
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"[run] building base model ONCE (model_id={model_id}, device={device})", flush=True)
+        model, tokenizer = build_real_model(model_id, device)
+        sequence = build_task_sequence(
+            mode, tokenizer=tokenizer, data_root=data_root,
+            batch_size=batch_size, max_len=max_len)
+    else:
+        model = build_model(mode)
+        tokenizer = None
+        sequence = build_task_sequence(mode, n_tasks=n_tasks, seed=0)
+
+    # Pristine weight snapshot (CPU) restored before each cell so every
+    # (arm, seed) trains from identical init without reloading from disk.
+    pristine = copy.deepcopy({k: v.detach().cpu() for k, v in model.state_dict().items()})
+    print(f"[run] snapshotted {len(pristine)} tensors as pristine init", flush=True)
+
+    total_cells = len(lambdas) * len(arms) * len(seeds)
+    done = 0
+    t_matrix = time.time()
 
     for lam in lambdas:
         for arm_name in arms:
             per_seed_metrics = []
             for seed in seeds:
+                done += 1
+                cached = _load_cell(lam, arm_name, seed)
+                if cached is not None:
+                    print("[cell %d/%d] SKIP (checkpointed) lam=%s arm=%s seed=%s"
+                          % (done, total_cells, lam, arm_name, seed), flush=True)
+                    per_seed_metrics.append(cached)
+                    continue
+
+                model.load_state_dict(pristine, strict=True)
                 torch.manual_seed(seed)
-                model = build_model(mode)
-                sequence = build_task_sequence(mode, n_tasks=n_tasks, seed=seed)
+
+                t0 = time.time()
+                print("[cell %d/%d] START lam=%s arm=%s seed=%s"
+                      % (done, total_cells, lam, arm_name, seed), flush=True)
+
                 ArmCls = ALL_ARMS[arm_name]
                 arm = _construct_arm(ArmCls, lam, seed)
                 out = run_arm_over_sequence(arm, model, sequence, lr, epochs)
+
+                dt = time.time() - t0
+                out["_meta"] = {"lam": lam, "arm": arm_name, "seed": seed,
+                                "seconds": round(dt, 1)}
+                # ---- FIX 1: checkpoint this cell immediately --------------
+                f = _cell_file(lam, arm_name, seed)
+                if f:
+                    f.write_text(json.dumps(out, indent=2))
+                    with open(progress_log, "a") as pl:
+                        pl.write(json.dumps({"lam": lam, "arm": arm_name,
+                                             "seed": seed, "seconds": round(dt, 1),
+                                             "bwt": out["metrics"]["bwt"]}) + "\n")
+                print("[cell %d/%d] DONE  lam=%s arm=%s seed=%s  bwt=%+.4f  %.1fs"
+                      % (done, total_cells, lam, arm_name, seed,
+                         out["metrics"]["bwt"], dt), flush=True)
                 per_seed_metrics.append(out)
+
             bwts = [m["metrics"]["bwt"] for m in per_seed_metrics]
             targ = [m["metrics"]["target_task_acc"] for m in per_seed_metrics]
             results[arm_name]["lambda_runs"][str(lam)] = {
@@ -250,6 +377,8 @@ def run(mode: str, arms: List[str], seeds: List[int], lambdas: List[float],
                 "target_task_acc": mean_std(targ),
                 "per_seed": per_seed_metrics,
             }
+    print("[run] matrix complete: %d/%d cells in %.1f min"
+          % (done, total_cells, (time.time() - t_matrix) / 60), flush=True)
     return results
 
 
@@ -294,12 +423,19 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-2)
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument("--model_id", type=str,
+                    default="meta-llama/Llama-3.2-3B-Instruct",
+                    help="HF base model for the real TRACE run")
+    ap.add_argument("--data_root", type=Path, default=None,
+                    help="dir holding the official TRACE task folders")
+    ap.add_argument("--batch_size", type=int, default=8)
+    ap.add_argument("--max_len", type=int, default=512)
     args = ap.parse_args()
 
     mode = "smoke" if args.smoke else "trace"
     seeds = args.seeds or ([0] if args.smoke else DEFAULT_SEEDS)
     lambdas = args.lambdas or ([0.1] if args.smoke else [0.0, 0.01, 0.1, 1.0, 10.0])
-    n_tasks = args.n_tasks or (3 if args.smoke else 5)
+    n_tasks = args.n_tasks or (3 if args.smoke else 8)
 
     if not args.smoke and len(seeds) < 5:
         print("[run] REFUSING: run of record requires n>=5 seeds (README). "
@@ -307,7 +443,18 @@ def main():
         sys.exit(2)
 
     started = datetime.now(timezone.utc).isoformat()
-    results = run(mode, args.arms, seeds, lambdas, n_tasks, args.lr, args.epochs)
+
+    # Checkpoint dir: default alongside the final --out file (i.e. results/),
+    # so per-cell JSONs are captured by the wrapper's partial-pull + B2 finalize.
+    out = args.out or (ROOT / "lab_reports" /
+                       f"exp1_{'smoke' if args.smoke else 'trace'}_{started[:19].replace(':','')}.json")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    ckpt_dir = out.parent / "cells"
+
+    results = run(mode, args.arms, seeds, lambdas, n_tasks, args.lr, args.epochs,
+                  model_id=args.model_id, data_root=args.data_root,
+                  batch_size=args.batch_size, max_len=args.max_len,
+                  ckpt_dir=ckpt_dir)
     verdicts = decide(results)
 
     record = {
@@ -323,9 +470,6 @@ def main():
                  "TRACE run is the run of record."),
     }
 
-    out = args.out or (ROOT / "lab_reports" /
-                       f"exp1_{'smoke' if args.smoke else 'trace'}_{started[:19].replace(':','')}.json")
-    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(record, indent=2))
 
     # concise console summary

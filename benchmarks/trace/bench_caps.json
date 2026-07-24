@@ -1,0 +1,7 @@
+{
+  "min_vram_gb": 24,
+  "required_compute_capability": "sm_80",
+  "preferred_gpus": ["A100-80GB", "A6000", "A40", "L40S", "RTX-6000-ADA"],
+  "remote_finalize": true,
+  "notes": "Experiment 1 (does the lock do anything). Llama-3.2-3B-Instruct + LoRA, sequential fine-tuning over the 8-task TRACE benchmark, per-arm (7 arms) x per-seed (n>=5) x lambda sweep. Envelope dominated by the base model + activations + per-task Fisher/M estimation passes. The M state itself is tiny (one float per neuron). At n>=5 seeds x 7 arms x 5 lambda points this is a multi-GPU-hour run; dispatch overnight. Data: official TRACE task folders must be staged under data/TRACE (see benchmarks/trace/trace_data.py)."
+}

@@ -1,0 +1,16 @@
+{
+  "benchmark": "trace",
+  "canonical_gpu": "A6000",
+  "cloud_type": "SECURE",
+  "container_disk_gb": 50,
+  "cost_per_hr_usd": 0.53,
+  "created_utc": "2026-07-24T02:52:12Z",
+  "data_centers": null,
+  "gpu_count": 1,
+  "gpu_type": "NVIDIA RTX A6000",
+  "image": "runpod/pytorch:1.0.7-rc.138-cu1281-torch291-ubuntu2204",
+  "pod_id": "eastjxu8cnhgwa",
+  "provider": "runpod",
+  "smoke": true,
+  "volume_gb": 20
+}
