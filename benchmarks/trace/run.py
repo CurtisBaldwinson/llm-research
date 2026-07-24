@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -823,8 +824,26 @@ def main():
     n_tasks = args.n_tasks or (3 if args.smoke else 8)
 
     started = datetime.now(timezone.utc).isoformat()
-    out = args.out or (ROOT / "lab_reports" /
-                       f"exp1_{'smoke' if args.smoke else 'trace'}_{started[:19].replace(':','')}.json")
+    stamp = started[:19].replace(":", "")
+    # Archive contract: anything that must survive cloud dispatch lives under
+    # the results/ directory the wrapper SCP/B2-pulls. Prefer (in order):
+    #   1. explicit --out
+    #   2. $SYNTH_RESULTS_DIR (set by the cloud wrapper)
+    #   3. ./results next to cwd (pod layout: REMOTE_BASE/<bench>/results)
+    #   4. local lab_reports/ (laptop-direct runs only)
+    if args.out is not None:
+        out = Path(args.out)
+    else:
+        env_results = os.environ.get("SYNTH_RESULTS_DIR")
+        cwd_results = Path.cwd() / "results"
+        if env_results:
+            out_dir = Path(env_results)
+        elif cwd_results.is_dir():
+            out_dir = cwd_results
+        else:
+            out_dir = ROOT / "lab_reports"
+        out = out_dir / f"exp1_{'smoke' if args.smoke else 'trace'}_{stamp}.json"
+    out = out.resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
 
     if args.tune_baselines:
@@ -852,6 +871,7 @@ def main():
                 tuning[k] = float(loaded[k])
         print(f"[run] loaded baseline tuning: {tuning}", flush=True)
 
+    # Cell checkpoints MUST sit next to the final JSON so B2/SCP capture them.
     ckpt_dir = out.parent / "cells"
 
     results = run(mode, args.arms, seeds, lambdas, n_tasks, args.lr, args.epochs,
@@ -893,7 +913,11 @@ def main():
 
     out.write_text(json.dumps(record, indent=2))
 
-    # concise console summary
+    # Human + dispatcher summary sibling (dispatcher looks for results_summary.txt).
+    summary_lines = [
+        f"=== Experiment 1 ({mode})  metric_scope={METRIC_SCOPE} ===",
+        f"record: {out.name}",
+    ]
     print(f"\n=== Experiment 1 ({mode})  metric_scope={METRIC_SCOPE} ===")
     for arm in args.arms:
         lr_runs = results[arm]["lambda_runs"]
@@ -904,22 +928,31 @@ def main():
         )
         if best:
             lam, r = best
-            print(f"  {arm:22s} best@λ={lam:>6}: "
-                  f"BWT={r['bwt']['mean']:+.4f}±{r['bwt']['std']:.4f}  "
-                  f"targetAcc={r['target_task_acc']['mean']:.3f}"
-                  f"  deg={r.get('n_degenerate', 0)}")
+            line = (f"  {arm:22s} best@λ={lam:>6}: "
+                    f"BWT={r['bwt']['mean']:+.4f}±{r['bwt']['std']:.4f}  "
+                    f"targetAcc={r['target_task_acc']['mean']:.3f}"
+                    f"  deg={r.get('n_degenerate', 0)}")
+            print(line)
+            summary_lines.append(line)
     print("\n  lock-vs-control 2σ (mechanism − isolation control), NTA proxy:")
+    summary_lines.append("lock-vs-control 2σ (NTA proxy):")
     for lam, v in relevance.get("lock_vs_control_2sigma_by_lambda", {}).items():
         flag = "PASS" if v.get("passes_matched_plasticity_2sigma") else "no"
-        print(f"    λ={lam:>6}: ΔBWT={v['delta_bwt']:+.4f}  "
-              f"Δ/σ={v['delta_over_sigma']:+.2f}  matched_plast="
-              f"{int(v.get('matched', 0))}  [{flag}]")
+        line = (f"    λ={lam:>6}: ΔBWT={v['delta_bwt']:+.4f}  "
+                f"Δ/σ={v['delta_over_sigma']:+.2f}  matched_plast="
+                f"{int(v.get('matched', 0))}  [{flag}]")
+        print(line)
+        summary_lines.append(line)
     ewc = relevance.get("beat_ewc_floor", {})
-    print(f"\n  beat EWC floor: "
-          f"{'PASS' if ewc.get('passes_beat_baseline') else 'no'}  "
-          f"ΔBWT={ewc.get('delta_bwt', float('nan')):+.4f}")
-    print(f"  beat weight-space (any): "
-          f"{'PASS' if relevance.get('beat_weight_space_any', {}).get('passes') else 'no'}")
+    ewc_line = (f"  beat EWC floor: "
+                f"{'PASS' if ewc.get('passes_beat_baseline') else 'no'}  "
+                f"ΔBWT={ewc.get('delta_bwt', float('nan')):+.4f}")
+    ws_line = (f"  beat weight-space (any): "
+               f"{'PASS' if relevance.get('beat_weight_space_any', {}).get('passes') else 'no'}")
+    print(f"\n{ewc_line}")
+    print(ws_line)
+    summary_lines.extend([ewc_line, ws_line, f"written: {out}"])
+    (out.parent / "results_summary.txt").write_text("\n".join(summary_lines) + "\n")
     print(f"\n  written: {out}")
 
 

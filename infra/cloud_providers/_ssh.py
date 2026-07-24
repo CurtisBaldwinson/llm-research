@@ -596,12 +596,24 @@ else
     exit 2
 fi
 
+# Archive contract: every durable artifact must land under $RESULTS_DIR so
+# SCP-pull and pod_finalize/B2 capture it.  Export SYNTH_RESULTS_DIR and
+# pass --out explicitly (benchmarks that ignore the env still get a path).
+export SYNTH_RESULTS_DIR="$RESULTS_DIR"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+OUT_JSON="$RESULTS_DIR/${{ENTRY%.py}}_${{STAMP}}.json"
+# Prefer a stable exp1_* name when running TRACE run.py.
+case "$ENTRY" in
+  run.py) OUT_JSON="$RESULTS_DIR/exp1_{'smoke' if smoke else 'trace'}_$STAMP.json" ;;
+esac
 echo "[wrapper] entry=$ENTRY  smoke_flag={smoke_flag!r}  extra_args={extra_args!r}"
+echo "[wrapper] SYNTH_RESULTS_DIR=$SYNTH_RESULTS_DIR"
+echo "[wrapper] --out $OUT_JSON"
 # python3 -u: disable Python's own stdout/stderr buffering.
 # stdbuf -oL -eL: line-buffer libc-level streams.
 # Both layers together ensure each `print(..., flush=True)` is on disk
 # by the time the next line of Python executes.
-stdbuf -oL -eL "$PYBIN" -u "$ENTRY" {smoke_flag} {extra_args}
+stdbuf -oL -eL "$PYBIN" -u "$ENTRY" {smoke_flag} {extra_args} --out "$OUT_JSON"
 RC=$?
 FINISHED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # Trace the trailing exit-path commands.  xtrace output goes to stderr,

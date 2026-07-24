@@ -183,6 +183,37 @@ status:
 	 else echo "No PID file in $(LOG_DIR)/ (launched via make smoke-bg / run-bg?)"; echo ""; fi; \
 	 if [ -f "$${latest}dispatcher.log" ]; then echo "--- last 15 lines of dispatcher.log ---"; tail -n 15 "$${latest}dispatcher.log"; fi
 
+## Promote the latest staging launch into lab_reports/<date>_<slug>/.
+## Copies (does not delete) the staging tree so reattach/B2 forensics stay put.
+## Usage: make archive [SLUG=exp1-smoke] [STAGE=lab_reports/_staging/.../]
+.PHONY: archive
+archive:
+	@STAGE="$(STAGE)"; \
+	 if [ -z "$$STAGE" ]; then \
+	   STAGE=$$(ls -td lab_reports/_staging/*_results_*/ lab_reports/_staging/_smokes/*_results_*/ 2>/dev/null | head -n1); \
+	 fi; \
+	 if [ -z "$$STAGE" ] || [ ! -d "$$STAGE" ]; then echo "No staging dir found"; exit 1; fi; \
+	 SLUG="$(if $(strip $(SLUG)),$(SLUG),trace)"; \
+	 STAMP=$$(date -u +%Y-%m-%d_%H%M); \
+	 DEST="lab_reports/$${STAMP}_$${SLUG}"; \
+	 mkdir -p "$$DEST"; \
+	 # Prefer the inner results/ tree (exp1_*.json, cells/, run.log, sentinels). \
+	 if [ -d "$${STAGE}results" ]; then \
+	   rsync -a "$${STAGE}results/" "$$DEST/results/"; \
+	 else \
+	   rsync -a "$$STAGE" "$$DEST/results/"; \
+	 fi; \
+	 for s in pod_provisioning.json dispatcher.log ORPHAN_POD.json; do \
+	   [ -f "$${STAGE}$$s" ] && cp -a "$${STAGE}$$s" "$$DEST/results/$$s"; \
+	 done; \
+	 # Convenience pointer at report root. \
+	 if ls "$$DEST/results"/exp1_*.json >/dev/null 2>&1; then \
+	   ln -sfn $$(ls -t "$$DEST/results"/exp1_*.json | head -n1 | xargs basename) "$$DEST/exp1_record.json"; \
+	 fi; \
+	 echo "Archived $$STAGE"; \
+	 echo "     -> $$DEST"; \
+	 echo "Record: $$(ls $$DEST/results/exp1_*.json 2>/dev/null || echo '(no exp1_*.json — check results/)')"
+
 ## Run the test suite (sm_core + eval + baselines).
 .PHONY: test
 test:
