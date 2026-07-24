@@ -298,7 +298,7 @@ class VultrProvider(CloudProvider):
             f"SSH-ready within {timeout_s}s"
         )
 
-    def destroy(self, instance: CloudInstance) -> None:
+    def destroy(self, instance: CloudInstance) -> bool:
         assert isinstance(instance, VultrInstance)
         try:
             r = requests.delete(
@@ -306,19 +306,22 @@ class VultrProvider(CloudProvider):
                 headers=self._headers(),
                 timeout=30,
             )
-            if r.status_code not in (200, 202, 204):
-                print(
-                    f"!! Failed to delete Vultr instance "
-                    f"{instance.instance_id}: HTTP {r.status_code}: "
-                    f"{r.text[:200]!r}",
-                    flush=True,
-                )
+            if r.status_code in (200, 202, 204, 404):
+                return True
+            print(
+                f"!! Failed to delete Vultr instance "
+                f"{instance.instance_id}: HTTP {r.status_code}: "
+                f"{r.text[:200]!r}",
+                flush=True,
+            )
+            return False
         except requests.RequestException as exc:
             print(
                 f"!! Failed to delete Vultr instance "
                 f"{instance.instance_id}: {exc}",
                 flush=True,
             )
+            return False
 
     # ---- Internal helpers ---------------------------------------------------
 

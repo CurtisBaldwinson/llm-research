@@ -220,8 +220,14 @@ class CloudProvider(abc.ABC):
         """
 
     @abc.abstractmethod
-    def destroy(self, instance: "CloudInstance") -> None:
-        """Best-effort delete.  Errors should be logged, not raised."""
+    def destroy(self, instance: "CloudInstance") -> bool:
+        """Best-effort delete with retries left to the orchestrator.
+
+        Returns True if the provider accepted the delete (HTTP 2xx / 404
+        already-gone).  Returns False on API/network failure after logging
+        — do not raise.  The orchestrator writes an ORPHAN_POD sidecar when
+        destroy returns False so billing leaks are operator-visible.
+        """
 
     # --- Re-attach (used by run_on_cloud.py --reattach) ------------------
 

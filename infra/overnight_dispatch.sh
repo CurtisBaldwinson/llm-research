@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # overnight_dispatch.sh
 #
+# *** QUARANTINED (Synthetic2 TRACE era) ***
+# This script targets v1 imp05 make targets and paths under scripts/
+# (run_on_cloud.py, .venv) that no longer exist. Running it will fail
+# mid-dispatch or launch the wrong experiment. Do not use until rewritten
+# for benchmarks/trace + infra/run_on_cloud.py + make run-parallel.
+#
 # Watcher that polls a B2-smoke staging dir until it succeeds (or fails),
 # then auto-dispatches the three v2.0.1 / v3.0 multi-seed sweeps:
 #
@@ -41,6 +47,12 @@
 # so the laptop can sleep (display-off only; -i prevents idle sleep).
 
 set -u
+
+echo "FATAL: infra/overnight_dispatch.sh is quarantined." >&2
+echo "It still references v1 imp05 make targets and scripts/run_on_cloud.py." >&2
+echo "Use: make run-parallel BENCH=trace  (via infra/launch_parallel_sweep.py)" >&2
+echo "Rewrite this watcher before un-quarantining." >&2
+exit 99
 
 SMOKE_STAGE="${1:-}"
 SMOKE_PID_FILE="${2:-}"

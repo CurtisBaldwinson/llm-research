@@ -480,8 +480,14 @@ def build_remote_wrapper(
         "fi; "
         "done"
     )
+    def _sh_quote(s: str) -> str:
+        return "'" + s.replace("'", "'\"'\"'") + "'"
+
     hf_token = os.environ.get("HF_TOKEN", "")
-    hf_export = f'export HF_TOKEN="{hf_token}"' if hf_token else "# HF_TOKEN not set"
+    hf_export = (
+        f"export HF_TOKEN={_sh_quote(hf_token)}" if hf_token
+        else "# HF_TOKEN not set"
+    )
 
     # Remote-finalize block, injected into the wrapper's EXIT path (after
     # the _DONE / _FINISHED sentinels are written, so the dispatcher's
@@ -651,7 +657,9 @@ def _build_finalize_block(benchmark: str, remote_finalize: dict | None) -> str:
       * Skips if the finalize payload isn't on the pod (defensive; should
         never happen because the dispatcher's launch path runs
         push_finalize_payload first when this block is non-empty).
-      * Exports B2 + RunPod secrets, then calls pod_finalize.py.
+      * Sources B2 + RunPod secrets from a mode-0600 env file staged
+        separately from this wrapper (secrets never live in ``_run.sh``),
+        then calls pod_finalize.py and shreds the env file.
       * Captures pod_finalize's stdout/stderr into run.log with a
         ``[finalize]`` prefix so the dispatcher's live tail surfaces it.
       * Failure is non-fatal: a ``|| echo ...`` clause keeps the
@@ -667,43 +675,33 @@ def _build_finalize_block(benchmark: str, remote_finalize: dict | None) -> str:
             f"remote_finalize config missing required keys: {missing}"
         )
 
-    # Shell-escape each secret literal.  Using single-quoted bash strings
-    # plus the standard "close-quote, escape, reopen-quote" idiom for any
-    # embedded single quotes; this is the safest form for secrets that
-    # could contain any printable byte.
     def _sh_quote(s: str) -> str:
         return "'" + s.replace("'", "'\"'\"'") + "'"
 
+    # Non-secret identifiers only in the wrapper body. Secrets are staged
+    # into REMOTE_FINALIZE_SECRETS_PATH (mode 0600) by launch_remote_detached.
     run_id = _sh_quote(remote_finalize["run_id"])
     b2_bucket = _sh_quote(remote_finalize["b2_bucket"])
-    b2_key_id = _sh_quote(remote_finalize["b2_key_id"])
-    b2_key = _sh_quote(remote_finalize["b2_key"])
-    runpod_api_key = _sh_quote(remote_finalize["runpod_api_key"])
-    pod_id = _sh_quote(remote_finalize["pod_id"])
+    secrets_path = f"{REMOTE_FINALIZE_DIR}/.finalize.env"
 
     return f"""# ---- remote-finalize block ----------------------------------------------
 # Encrypt + upload to B2 + self-terminate the pod.  Only runs on a
 # successful benchmark exit (RC=0); failed runs are left intact for
 # manual investigation via SCP.
+# Secrets live in {secrets_path} (mode 0600), NOT in this wrapper file.
 if [ "$RC" = "0" ] \\
         && [ -f "{REMOTE_FINALIZE_DIR}/pod_finalize.py" ] \\
         && [ -f "{REMOTE_FINALIZE_DIR}/synth_crypto.py" ] \\
-        && [ -f "{REMOTE_FINALIZE_DIR}/synth-results.pub" ]; then
+        && [ -f "{REMOTE_FINALIZE_DIR}/synth-results.pub" ] \\
+        && [ -f "{secrets_path}" ]; then
     echo "[wrapper] remote-finalize: invoking pod_finalize.py"
-    # Secrets exported only within this subshell; visible to the python
-    # process below but not to any later wrapper commands (there are
-    # none after this block aside from `exit $RC`).
     (
-        export B2_KEY_ID_POD={b2_key_id}
-        export B2_KEY_POD={b2_key}
-        export B2_BUCKET={b2_bucket}
-        export RUNPOD_API_KEY={runpod_api_key}
-        # RUNPOD_POD_ID is NOT auto-injected by RunPod's runtime into
-        # SSH login sessions, so the dispatcher forwards it explicitly
-        # from the provider's create-instance response.  Without this
-        # explicit forward, pod_finalize.py would FATAL on the env-var
-        # check and the pod would never self-terminate.
-        export RUNPOD_POD_ID={pod_id}
+        set -a
+        # shellcheck disable=SC1090
+        . "{secrets_path}"
+        set +a
+        # Drop secrets from disk as soon as they are in this subshell env.
+        rm -f "{secrets_path}" 2>/dev/null || true
         "$PYBIN" "{REMOTE_FINALIZE_DIR}/pod_finalize.py" \\
             --results-dir "$RESULTS_DIR" \\
             --recipient-pubkey "{REMOTE_FINALIZE_DIR}/synth-results.pub" \\
@@ -712,12 +710,55 @@ if [ "$RC" = "0" ] \\
             --b2-bucket {b2_bucket} \\
             2>&1 | sed 's/^/[finalize] /'
     ) || echo "[wrapper] remote-finalize: pod_finalize.py FAILED; pod left alive for SCP fallback"
+    # Belt-and-suspenders: ensure secrets file is gone even on early exit.
+    rm -f "{secrets_path}" 2>/dev/null || true
 elif [ "$RC" != "0" ]; then
     echo "[wrapper] remote-finalize: skipped (benchmark RC=$RC != 0; leaving pod alive for investigation)"
+    rm -f "{secrets_path}" 2>/dev/null || true
 else
-    echo "[wrapper] remote-finalize: payload missing under {REMOTE_FINALIZE_DIR}/; skipping"
+    echo "[wrapper] remote-finalize: payload or secrets missing under {REMOTE_FINALIZE_DIR}/; skipping"
 fi
 # ---- end remote-finalize block ------------------------------------------"""
+
+
+def _stage_remote_finalize_secrets(
+    ssh_target: List[str], remote_finalize: dict
+) -> None:
+    """Write mode-0600 finalize secrets env file on the remote.
+
+    Secrets are intentionally kept out of ``_run.sh`` (which is world-
+    readable on many community images and may persist on residual
+    volumes).  The wrapper sources this file inside a subshell and
+    deletes it immediately.
+    """
+    def _sh_quote(s: str) -> str:
+        return "'" + s.replace("'", "'\"'\"'") + "'"
+
+    secrets_path = f"{REMOTE_FINALIZE_DIR}/.finalize.env"
+    body = (
+        f"export B2_KEY_ID_POD={_sh_quote(remote_finalize['b2_key_id'])}\n"
+        f"export B2_KEY_POD={_sh_quote(remote_finalize['b2_key'])}\n"
+        f"export B2_BUCKET={_sh_quote(remote_finalize['b2_bucket'])}\n"
+        f"export RUNPOD_API_KEY={_sh_quote(remote_finalize['runpod_api_key'])}\n"
+        f"export RUNPOD_POD_ID={_sh_quote(remote_finalize['pod_id'])}\n"
+    )
+    # Use a quoted heredoc so the shell never expands secret contents.
+    cmd = (
+        f"mkdir -p {REMOTE_FINALIZE_DIR}\n"
+        f"cat > {secrets_path} <<'__SM_FINALIZE_ENV_EOF__'\n"
+        f"{body}"
+        f"__SM_FINALIZE_ENV_EOF__\n"
+        f"chmod 600 {secrets_path}\n"
+    )
+    r = subprocess.run(
+        ssh_cmd(ssh_target) + [cmd],
+        capture_output=True, text=True, timeout=60,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"Failed to stage remote finalize secrets (rc={r.returncode}): "
+            f"{r.stderr}"
+        )
 
 
 def launch_remote_detached(
@@ -731,15 +772,18 @@ def launch_remote_detached(
     """Write the wrapper to the remote, kick it off under nohup, return run info.
 
     Pass ``remote_finalize`` (a dict containing run_id, b2_bucket,
-    b2_key_id, b2_key, and runpod_api_key) to enable the pod-side
+    b2_key_id, b2_key, runpod_api_key, and pod_id) to enable the pod-side
     encrypt + upload + self-terminate stack.  Defaults to ``None``
     which preserves the original behavior (dispatcher SCP-pulls and
-    destroys).
+    destroys).  Secrets are staged into a mode-0600 env file under
+    ``_finalize/``, never into the wrapper script body.
     """
     print(f"==> Launching {benchmark} on remote under nohup (smoke={smoke}"
           f"{', extra_args=' + repr(extra_args) if extra_args else ''}"
           f"{', remote_finalize=on' if remote_finalize else ''})",
           flush=True)
+    if remote_finalize is not None:
+        _stage_remote_finalize_secrets(ssh_target, remote_finalize)
     wrapper_body = build_remote_wrapper(
         benchmark, smoke, extra_args, remote_finalize=remote_finalize,
     )
@@ -753,8 +797,8 @@ def launch_remote_detached(
     setup_cmd = (
         "set -e\n"
         f"mkdir -p {results_dir}\n"
-        # Remove stale _DONE sentinels from any prior attempt on the same pod.
-        f"rm -f {results_dir}/_DONE.* {pid_path}\n"
+        # Remove stale _DONE / _UPLOADED sentinels from any prior attempt.
+        f"rm -f {results_dir}/_DONE.* {results_dir}/_UPLOADED {pid_path}\n"
         f"cat > {wrapper_path} <<'__SM_RUNNER_EOF__'\n"
         f"{wrapper_body}\n"
         "__SM_RUNNER_EOF__\n"
@@ -903,13 +947,15 @@ def poll_until_done(
                       flush=True)
             last_partial_pull = time.time()
 
-        # 3. Completion sentinel check.
+        # 3. Completion sentinel check. Prefer the newest _DONE.* by mtime
+        # so a stale sentinel from a prior reattach/rerun cannot win.
         check = ssh_run(
             ssh_target,
-            f"ls {done_glob} 2>/dev/null | head -1",
+            f"ls -t {done_glob} 2>/dev/null | head -1",
             timeout=30,
         )
-        sentinel = (check.stdout or "").strip()
+        sentinel = (check.stdout or "").strip().splitlines()
+        sentinel = sentinel[0].strip() if sentinel else ""
         if sentinel:
             try:
                 rc = int(sentinel.rsplit(".", 1)[-1])
@@ -928,6 +974,53 @@ def poll_until_done(
             return rc, dest
 
         time.sleep(poll_interval_s)
+
+
+def wait_for_remote_finalize(
+    ssh_target: List[str],
+    benchmark: str,
+    *,
+    timeout_s: int = 180,
+    poll_interval_s: int = 10,
+) -> str:
+    """Wait for pod_finalize to finish after a successful ``_DONE.0``.
+
+    Returns one of:
+      * ``"uploaded"`` — ``results/_UPLOADED`` is present (finalize committed;
+        pod may still be alive briefly before self-terminate).
+      * ``"ssh_gone"`` — SSH became unreachable (self-terminate likely already
+        took the pod down; B2 pivot is the recovery path if local pull is thin).
+      * ``"timeout"`` — neither condition met within ``timeout_s``.
+
+    The dispatcher uses this to avoid destroying the pod while
+    ``pod_finalize.py`` is still encrypting/uploading.
+    """
+    results_dir = f"{REMOTE_BASE}/{benchmark}/results"
+    uploaded = f"{results_dir}/_UPLOADED"
+    deadline = time.time() + max(1, timeout_s)
+    print(
+        f"==> Waiting up to {timeout_s}s for remote finalize "
+        f"(_UPLOADED or SSH down)...",
+        flush=True,
+    )
+    while time.time() < deadline:
+        check = ssh_run(
+            ssh_target,
+            f"if [ -f {uploaded} ]; then echo UPLOADED; else echo WAIT; fi",
+            timeout=30,
+        )
+        if check.returncode != 0:
+            print("    remote finalize: SSH unreachable (treating as ssh_gone)",
+                  flush=True)
+            return "ssh_gone"
+        status = (check.stdout or "").strip()
+        if status == "UPLOADED":
+            print("    remote finalize: _UPLOADED present", flush=True)
+            return "uploaded"
+        time.sleep(max(1, poll_interval_s))
+    print("!! remote finalize wait timed out; dispatcher will proceed with destroy",
+          flush=True)
+    return "timeout"
 
 
 def run_remote_experiment(

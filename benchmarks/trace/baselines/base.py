@@ -25,7 +25,19 @@ Baselines that do nothing at a hook just inherit the no-op default.
 
 from __future__ import annotations
 
-from typing import Optional, Any
+from typing import Any, Dict, Optional
+
+
+class DegenerateSignalError(RuntimeError):
+    """Raised when M or Fisher collapses to a mechanism-inert signal.
+
+    The TRACE harness catches this per-cell, writes a
+    ``{"degenerate": true, ...}`` checkpoint, and continues the matrix.
+    """
+
+    def __init__(self, message: str, *, details: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.details = dict(details or {})
 
 
 class Arm:

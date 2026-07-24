@@ -101,10 +101,12 @@ from cloud_providers._ssh import (
     FinalizePayloadError,
     _TeeWriter,
     poll_until_done,
+    pull_results_into,
     push_code,
     push_finalize_payload,
     remote_paths_for,
     run_remote_experiment,
+    wait_for_remote_finalize,
 )
 
 
@@ -279,27 +281,28 @@ def _should_keep_alive(
     run_completed: bool,
     rc: int,
     keep_on_fail: bool,
+    remote_may_be_running: bool = True,
 ) -> bool:
     """Return True iff the dispatcher should leave the instance running.
 
     Decision table:
-      * ``run_completed=False`` (no _DONE sentinel)              -> keep alive.
-        The remote python may still be mid-execution; destroying mid-flight
-        discards whatever's been computed but not yet pulled.  Triggered by
-        KeyboardInterrupt and poll-loop SSH-failure abort.
-      * ``run_completed=True, rc==0``                            -> destroy.
+      * ``run_completed=False, remote_may_be_running=True``  -> keep alive.
+        The remote python may still be mid-execution (KeyboardInterrupt
+        after launch, or poll-loop SSH-failure abort). Destroying would
+        discard in-progress work that has not yet been pulled.
+      * ``run_completed=False, remote_may_be_running=False`` -> destroy.
+        Pre-run failure: wait_for_ready timeout, push_code failure,
+        remote_finalize setup error, etc. Nothing useful is running on
+        the pod; keeping it alive is pure orphan billing.
+      * ``run_completed=True, rc==0``                        -> destroy.
         Success path: results pulled, nothing more to do.
-      * ``run_completed=True, rc!=0, keep_on_fail=False``        -> destroy.
-        The remote python exited cleanly with an error code; dispatcher has
-        already pulled run.log + results/; the pod has zero remaining
-        diagnostic value and is just burning billing.  This is the case
-        operators most often hit; defaulting to destroy here saves real money.
-      * ``run_completed=True, rc!=0, keep_on_fail=True``         -> keep alive.
-        Explicit opt-in for the rare non-reproducible failure where SSHing
-        into the live pod is worth the per-hour rate.
+      * ``run_completed=True, rc!=0, keep_on_fail=False``    -> destroy.
+        Sentinel-confirmed error exit; dispatcher already pulled logs.
+      * ``run_completed=True, rc!=0, keep_on_fail=True``     -> keep alive.
+        Explicit opt-in for live SSH debugging of a failed run.
     """
     if not run_completed:
-        return True
+        return bool(remote_may_be_running)
     return rc != 0 and keep_on_fail
 
 
@@ -310,18 +313,24 @@ def _should_keep_alive(
 def _print_summary(results_dir: Optional[Path]) -> None:
     """Print the SUMMARY block from ``results/results_summary.txt``.
 
-    Identical text in fresh-launch and re-attach paths so dispatcher logs
-    look the same regardless of which entry path produced them.
+    Accepts either the launch staging dir (SCP contract:
+    ``<launch>/results/results_summary.txt``) or the B2 pivot dest
+    (``<launch>/results/`` directly), so both recovery paths print the
+    same summary.
     """
     print("\n==> SUMMARY")
     if results_dir is None:
         print("(no results_dir; run never started or aborted before producing one)")
         return
-    summary_path = results_dir / "results" / "results_summary.txt"
-    if summary_path.exists():
+    candidates = [
+        results_dir / "results" / "results_summary.txt",
+        results_dir / "results_summary.txt",
+    ]
+    summary_path = next((p for p in candidates if p.exists()), None)
+    if summary_path is not None:
         print(summary_path.read_text())
     else:
-        print(f"(no results_summary.txt at {summary_path})")
+        print(f"(no results_summary.txt under {results_dir})")
     print(f"\n==> All results in: {results_dir}")
 
 
@@ -329,9 +338,10 @@ def _print_summary(results_dir: Optional[Path]) -> None:
 # Remote-finalize wiring (pod-side encrypt + upload + self-terminate)
 # ---------------------------------------------------------------------------
 
-# Env vars consumed when bench_caps.remote_finalize is True.  All five
-# must be present or the dispatcher refuses to launch.  Sourced from
-# the operator's ``.env`` via the existing Makefile include line.
+# Env vars consumed when bench_caps.remote_finalize is True.  All must be
+# present or the dispatcher refuses to enable remote finalize.  Sourced
+# from the operator's ``.env`` via the existing Makefile include line.
+# RunPod-only: self-terminate uses the RunPod REST API.
 _REMOTE_FINALIZE_ENV_KEYS = (
     "RUNPOD_API_KEY",
     "B2_KEY_ID_POD",
@@ -339,13 +349,16 @@ _REMOTE_FINALIZE_ENV_KEYS = (
     "B2_BUCKET",
 )
 _DEFAULT_PUBKEY_PATH = PROJECT_ROOT / "infra" / "keys" / "synth-results.pub"
+_DESTROY_RETRIES = 3
+_DESTROY_RETRY_SLEEP_S = 2.0
+_REMOTE_FINALIZE_WAIT_S = 180
 
 
 def _build_remote_finalize_config(*, launch_dir: Path, pod_id: str) -> dict:
     """Assemble the dict consumed by ``_ssh.build_remote_wrapper``.
 
-    Reads the five required secrets from the process environment (which
-    the Makefile populates from ``.env``).  Uses the launch directory's
+    Reads the required secrets from the process environment (which the
+    Makefile populates from ``.env``).  Uses the launch directory's
     basename as the ``run_id``, which keeps the B2 layout
     (``<bench>/<run_id>/results.synth``) aligned with the local staging
     layout (``lab_reports/_staging/<run_id>/``) for one-to-one mapping
@@ -363,7 +376,12 @@ def _build_remote_finalize_config(*, launch_dir: Path, pod_id: str) -> dict:
         raise RuntimeError(
             "remote_finalize: missing required env vars: "
             + ", ".join(missing)
-            + ".  Populate .env (or scripts/.env.template) and re-source."
+            + ".  Populate .env (or infra/.env.template) and re-source."
+        )
+    if not pod_id:
+        raise RuntimeError(
+            "remote_finalize: empty pod_id; remote finalize is RunPod-only "
+            "and requires a live pod id from provider.create()."
         )
     return {
         "run_id": launch_dir.name,
@@ -378,23 +396,37 @@ def _build_remote_finalize_config(*, launch_dir: Path, pod_id: str) -> dict:
 def _maybe_push_finalize_payload(
     *,
     caps: BenchCaps,
+    provider: CloudProvider,
+    instance: CloudInstance,
     ssh_target: List[str],
     pubkey_path: Path,
-) -> bool:
-    """Push the finalize payload to the pod when bench_caps opts in.
+    launch_dir: Path,
+) -> Optional[dict]:
+    """Push finalize payload and return remote_finalize cfg, or None.
 
-    Returns True iff the payload was pushed (i.e., the wrapper should
-    be configured with a ``remote_finalize`` block).  Returns False
-    when the benchmark doesn't opt in -- the wrapper falls back to the
-    legacy SCP-pull flow.
-
-    Raises :class:`FinalizePayloadError` (re-raised from
-    ``push_finalize_payload``) when the local payload files are
-    missing so the operator gets a clear error pre-launch instead of a
-    silent missing-pod_finalize at runtime.
+    Remote finalize is RunPod-only (self-terminate uses RunPod REST +
+    ``pod_id``).  When bench_caps opts in on a non-RunPod provider, we
+    log and fall back to the legacy SCP-pull path rather than crashing
+    after the pod is already billing.
     """
     if not caps.remote_finalize:
-        return False
+        return None
+    if getattr(provider, "name", None) != "runpod":
+        print(
+            f"!! bench_caps.remote_finalize=True but provider="
+            f"{getattr(provider, 'name', '?')!r}; remote finalize is "
+            f"RunPod-only. Falling back to SCP-pull + dispatcher destroy.",
+            flush=True,
+        )
+        return None
+    pod_id = getattr(instance, "pod_id", None)
+    if not pod_id:
+        print(
+            "!! remote_finalize requested but instance has no pod_id; "
+            "falling back to SCP-pull + dispatcher destroy.",
+            flush=True,
+        )
+        return None
     print(
         f"==> bench_caps.remote_finalize=True; pushing finalize payload "
         f"(pubkey={pubkey_path})",
@@ -405,7 +437,97 @@ def _maybe_push_finalize_payload(
         ssh_target=ssh_target,
         pubkey_path=pubkey_path,
     )
-    return True
+    return _build_remote_finalize_config(launch_dir=launch_dir, pod_id=str(pod_id))
+
+
+def _instance_id_for_orphan(instance: CloudInstance) -> str:
+    """Best-effort stable id for ORPHAN_POD sidecars across providers."""
+    for attr in ("pod_id", "instance_id"):
+        val = getattr(instance, attr, None)
+        if val:
+            return str(val)
+    try:
+        prov = instance.provenance()
+        for key in ("pod_id", "instance_id", "id"):
+            if prov.get(key):
+                return str(prov[key])
+    except Exception:
+        pass
+    return instance.label()
+
+
+def _write_orphan_sidecar(
+    *,
+    launch_dir: Optional[Path],
+    instance: CloudInstance,
+    provider: CloudProvider,
+    reason: str,
+) -> None:
+    """Persist orphan metadata so ``make reap`` / operators can find leaks."""
+    if launch_dir is None:
+        return
+    payload = {
+        "provider": getattr(provider, "name", None),
+        "instance_id": _instance_id_for_orphan(instance),
+        "label": instance.label(),
+        "reason": reason,
+        "written_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "provenance": None,
+    }
+    try:
+        payload["provenance"] = instance.provenance()
+    except Exception as exc:
+        payload["provenance_error"] = f"{type(exc).__name__}: {exc}"
+    path = launch_dir / "ORPHAN_POD.json"
+    try:
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n")
+        print(f"!! Wrote orphan sidecar: {path}", flush=True)
+    except OSError as exc:
+        print(f"!! Failed to write ORPHAN_POD.json: {exc}", flush=True)
+
+
+def _destroy_with_retry(
+    *,
+    provider: CloudProvider,
+    instance: CloudInstance,
+    launch_dir: Optional[Path],
+    reason: str,
+) -> bool:
+    """Retry provider.destroy; write ORPHAN_POD.json on persistent failure.
+
+    Returns True iff destroy reported success.
+    """
+    last_ok = False
+    for attempt in range(1, _DESTROY_RETRIES + 1):
+        try:
+            result = provider.destroy(instance)
+            # Providers may return None (legacy) or bool.
+            last_ok = True if result is None else bool(result)
+        except Exception as exc:
+            last_ok = False
+            print(
+                f"!! destroy attempt {attempt}/{_DESTROY_RETRIES} raised "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+        if last_ok:
+            if attempt > 1:
+                print(f"==> destroy succeeded on attempt {attempt}", flush=True)
+            return True
+        if attempt < _DESTROY_RETRIES:
+            time.sleep(_DESTROY_RETRY_SLEEP_S * attempt)
+    _write_orphan_sidecar(
+        launch_dir=launch_dir,
+        instance=instance,
+        provider=provider,
+        reason=f"destroy_failed_after_{_DESTROY_RETRIES}_retries: {reason}",
+    )
+    print(
+        "!! DESTROY FAILED after retries — instance may still be billing. "
+        f"See ORPHAN_POD.json under {launch_dir}.",
+        flush=True,
+    )
+    return False
 
 
 def _decide_and_destroy(
@@ -416,6 +538,9 @@ def _decide_and_destroy(
     provider: CloudProvider,
     keep_on_fail: bool,
     results_dir: Optional[Path],
+    remote_may_be_running: bool = True,
+    launch_dir: Optional[Path] = None,
+    skip_destroy: bool = False,
 ) -> bool:
     """Apply the destruction policy.  Returns True iff instance was destroyed.
 
@@ -423,12 +548,24 @@ def _decide_and_destroy(
     (print + ``provider.destroy``) live here so the routing decision stays
     independently unit-testable.
     """
+    if skip_destroy:
+        print(
+            "==> Skipping dispatcher destroy (remote_finalize already "
+            "self-terminated or _UPLOADED confirmed; pod expected gone).",
+            flush=True,
+        )
+        return True
     keep_alive = _should_keep_alive(
-        run_completed=run_completed, rc=rc, keep_on_fail=keep_on_fail,
+        run_completed=run_completed,
+        rc=rc,
+        keep_on_fail=keep_on_fail,
+        remote_may_be_running=remote_may_be_running,
     )
     if keep_alive:
-        if not run_completed:
+        if not run_completed and remote_may_be_running:
             reason = "no sentinel — remote may still be running"
+        elif not run_completed:
+            reason = "no sentinel but remote was never launched (should destroy)"
         else:
             reason = f"rc={rc} and --keep-on-fail set"
         print(f"!! INSTANCE LEFT ALIVE ({reason}).")
@@ -437,11 +574,26 @@ def _decide_and_destroy(
             print(f"   Partial results so far: {results_dir}")
         print("   To destroy manually, see the provider plugin "
               "documentation or your provider's console.")
+        if not run_completed and remote_may_be_running:
+            _write_orphan_sidecar(
+                launch_dir=launch_dir,
+                instance=instance,
+                provider=provider,
+                reason="kept_alive_remote_may_be_running",
+            )
         return False
-    provider.destroy(instance)
-    outcome = "success" if rc == 0 else f"failure rc={rc}"
-    print(f"==> Instance destroyed ({outcome}).  Billing stopped.")
-    return True
+    ok = _destroy_with_retry(
+        provider=provider,
+        instance=instance,
+        launch_dir=launch_dir,
+        reason=f"rc={rc} run_completed={run_completed}",
+    )
+    if ok:
+        outcome = "success" if rc == 0 else f"failure rc={rc}"
+        if not run_completed:
+            outcome = "pre-run failure (nothing useful running)"
+        print(f"==> Instance destroyed ({outcome}).  Billing stopped.")
+    return ok
 
 
 def _maybe_auto_finalize(
@@ -782,6 +934,9 @@ def _run_reattach(args: argparse.Namespace) -> None:
     rc = 1
     results_dir: Optional[Path] = None
     run_completed = False
+    # Reattach implies the remote was already launched.
+    remote_may_be_running = True
+    skip_destroy = False
     try:
         rc, results_dir = poll_until_done(
             instance.ssh_target(),
@@ -811,6 +966,9 @@ def _run_reattach(args: argparse.Namespace) -> None:
             provider=provider,
             keep_on_fail=args.keep_on_fail,
             results_dir=results_dir,
+            remote_may_be_running=remote_may_be_running,
+            launch_dir=launch_dir,
+            skip_destroy=skip_destroy,
         )
         _maybe_auto_finalize(
             rc=rc,
@@ -914,10 +1072,11 @@ def main() -> None:
              "sentinel-confirmed exit (zero or non-zero) since the "
              "dispatcher has already pulled run.log and results/ at that "
              "point and the pod is just idling and billing.  Pods are "
-             "ALWAYS kept alive when the run never produced a _DONE "
-             "sentinel (KeyboardInterrupt, SSH-failure abort) — the "
-             "remote may still be running and destroying mid-flight "
-             "would lose in-progress state.",
+             "kept alive when the remote wrapper was launched but no "
+             "_DONE sentinel appeared (KeyboardInterrupt after launch, "
+             "SSH-failure abort mid-run) — the remote may still be "
+             "running.  Pre-run failures (ready timeout, push failure) "
+             "ALWAYS destroy: nothing useful is running on the pod.",
     )
     parser.add_argument(
         "--ready-timeout", type=int, default=900,
@@ -1100,6 +1259,12 @@ def main() -> None:
     rc = 1
     results_dir: Optional[Path] = None
     run_completed = False
+    # False until the remote wrapper is actually launched. Pre-run
+    # failures (ready timeout, push, finalize setup) must destroy the
+    # pod — nothing useful is running and keep-alive would orphan-bill.
+    remote_may_be_running = False
+    remote_finalize_cfg: Optional[dict] = None
+    skip_destroy = False
     try:
         print(f"==> Waiting for instance SSH access (up to "
               f"{args.ready_timeout}s)...")
@@ -1112,20 +1277,19 @@ def main() -> None:
         push_code(args.project_root, args.benchmark, ssh_target)
 
         # Remote-finalize opt-in (bench_caps.remote_finalize=true):
-        # push the encrypt/upload/self-terminate stack to the pod and
-        # build the runtime config dict that the wrapper bakes in.
-        # Default is None (legacy SCP-pull path; pod waits for dispatcher).
-        remote_finalize_cfg: Optional[dict] = None
-        if _maybe_push_finalize_payload(
+        # RunPod-only encrypt/upload/self-terminate. Non-RunPod providers
+        # fall back to SCP-pull + dispatcher destroy.
+        remote_finalize_cfg = _maybe_push_finalize_payload(
             caps=caps,
+            provider=provider,
+            instance=instance,
             ssh_target=ssh_target,
             pubkey_path=_DEFAULT_PUBKEY_PATH,
-        ):
-            remote_finalize_cfg = _build_remote_finalize_config(
-                launch_dir=launch_dir,
-                pod_id=instance.pod_id,
-            )
+            launch_dir=launch_dir,
+        )
 
+        # From here the remote wrapper may be running under nohup.
+        remote_may_be_running = True
         rc, results_dir = run_remote_experiment(
             ssh_target, args.benchmark,
             smoke=args.smoke,
@@ -1135,6 +1299,30 @@ def main() -> None:
             remote_finalize=remote_finalize_cfg,
         )
         run_completed = rc >= 0
+
+        # After a successful sentinel with remote_finalize, wait for
+        # _UPLOADED (or SSH death) before dispatcher destroy so we do
+        # not kill pod_finalize mid-upload.
+        if (
+            remote_finalize_cfg is not None
+            and run_completed
+            and rc == 0
+            and results_dir is not None
+        ):
+            fin = wait_for_remote_finalize(
+                ssh_target,
+                args.benchmark,
+                timeout_s=_REMOTE_FINALIZE_WAIT_S,
+                poll_interval_s=min(15, args.poll_interval),
+            )
+            if fin in ("uploaded", "ssh_gone"):
+                # Pod self-terminate is expected; dispatcher destroy is
+                # best-effort idempotent cleanup only.
+                skip_destroy = fin == "ssh_gone"
+                # Final pull may already have the results; refresh once
+                # if SSH is still up (uploaded but not yet terminated).
+                if fin == "uploaded":
+                    pull_results_into(ssh_target, args.benchmark, launch_dir)
 
         # B2 pivot on the fresh-launch path: when remote_finalize is
         # enabled and the poll loop exhausted its SSH-failure budget
@@ -1161,25 +1349,52 @@ def main() -> None:
                 _write_b2_pivot_done_sentinel(launch_dir)
                 rc = 0
                 run_completed = True
-                results_dir = pivot.dest_dir
+                # SCP contract: results_dir is the launch staging dir
+                # (contents under launch_dir/results/). B2 pivot extracts
+                # into the same layout; keep the launch_dir handle so
+                # _print_summary path resolution stays consistent.
+                results_dir = launch_dir
+                skip_destroy = True
+                remote_may_be_running = False
 
         if rc != 0:
             print(f"!! Remote experiment exited with code {rc}",
                   file=sys.stderr)
         _print_summary(results_dir)
     except KeyboardInterrupt:
+        if remote_may_be_running:
+            print(
+                "\n!! Interrupted by operator.  Instance will be left alive so "
+                "the remote run can finish; rerun the dispatcher (or destroy "
+                "manually) when you decide.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "\n!! Interrupted before remote launch.  Instance will be "
+                "destroyed to stop billing.",
+                file=sys.stderr,
+            )
+        rc = 1
+        run_completed = False
+    except Exception as exc:
+        # Pre-run failures must not silently orphan the pod (finally
+        # destroys when remote_may_be_running is False). Mid-run errors
+        # keep the pod so in-progress work is not discarded.
         print(
-            "\n!! Interrupted by operator.  Instance will be left alive so "
-            "the remote run can finish; rerun the dispatcher (or destroy "
-            "manually) when you decide.",
+            f"\n!! Dispatcher error ({type(exc).__name__}: {exc}). "
+            f"remote_may_be_running={remote_may_be_running}.",
             file=sys.stderr,
         )
+        rc = 1
+        run_completed = False
     finally:
         # Destruction policy lives in _decide_and_destroy:
-        #   * Sentinel-confirmed exit (run_completed=True) → destroy.
-        #   * No sentinel (run_completed=False) → keep alive.
+        #   * Sentinel-confirmed exit (run_completed=True) → destroy
+        #     (unless remote_finalize already took the pod down).
+        #   * No sentinel + remote never launched → destroy (orphan fix).
+        #   * No sentinel + remote may be running → keep alive.
         #   * --keep-on-fail → keep alive on non-zero rc.
-        # Re-attach (--reattach) shares this exact path verbatim.
         destroyed = _decide_and_destroy(
             rc=rc,
             run_completed=run_completed,
@@ -1187,6 +1402,9 @@ def main() -> None:
             provider=provider,
             keep_on_fail=args.keep_on_fail,
             results_dir=results_dir,
+            remote_may_be_running=remote_may_be_running,
+            launch_dir=launch_dir,
+            skip_destroy=skip_destroy,
         )
         _maybe_auto_finalize(
             rc=rc,
@@ -1197,6 +1415,15 @@ def main() -> None:
             operator=args.auto_finalize_operator,
             ledger_description=args.auto_finalize_ledger_description,
         )
+        # Surface destroy failures as a non-zero exit even on rc==0 so
+        # operators notice orphan billing.
+        if not destroyed and not _should_keep_alive(
+            run_completed=run_completed,
+            rc=rc,
+            keep_on_fail=args.keep_on_fail,
+            remote_may_be_running=remote_may_be_running,
+        ) and not skip_destroy:
+            rc = max(rc, 1) if rc != 0 else 3
 
     if rc == 0:
         sys.exit(0)

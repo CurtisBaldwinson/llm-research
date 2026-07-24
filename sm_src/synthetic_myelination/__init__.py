@@ -19,6 +19,11 @@ from .attenuation import (
     threshold_gate,
 )
 from .hooks import ActivityCapture
+from .batch_utils import (
+    check_degenerate_importance,
+    check_m_hard_degenerate,
+    unpack_lm_batch,
+)
 from .m_coupled_regularizer import (
     MCoupledRegularizer,
     bimodality_coefficient,
@@ -38,12 +43,15 @@ __all__ = [
     "auto_assign_roles",
     "bimodality_coefficient",
     "check_degenerate_M",
+    "check_degenerate_importance",
+    "check_m_hard_degenerate",
     "estimate_fisher_diagonal",
     "get_gate",
     "linear_gate",
     "power_gate",
     "sigmoid_gate",
     "threshold_gate",
+    "unpack_lm_batch",
 ]
 
 __version__ = "0.2.0"

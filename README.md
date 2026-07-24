@@ -17,11 +17,14 @@ approximations of one another.
 Synthetic2 tests the **only two components of the myelin paradigm that EWC
 structurally lacks**:
 
-1. **The lock (discrete, bimodal plasticity).** EWC's penalty is continuous — every
-   parameter is somewhat sprung. Myelination is closer to a discrete state change: a
-   parameter is either plastic or locked. Hypothesis: a hard freeze on a small,
-   well-chosen subset of parameters — leaving the rest fully plastic — attacks EWC's
-   ossification failure mode better than a continuous penalty does.
+1. **The lock (asymptotic soft, penalty-based consolidation).** EWC's penalty is a
+   continuous spring on every parameter. Myelination is closer to a discrete state
+   change: a parameter is either plastic or consolidated. Hypothesis: an
+   **asymptotic (soft, penalty-based) consolidation lock** that raises the
+   importance-weight floor on a small, well-chosen subset — leaving the rest at low
+   penalty — attacks EWC's ossification failure mode better than a purely continuous
+   Fisher penalty does. Phase 1 does **not** hard-freeze parameters or gate gradients
+   (`apply_gate` is deferred); the lock only changes the quadratic penalty weights.
 
 2. **Demyelination (dynamic release).** Real myelin is *removed* and re-laid during
    learning. EWC only ever adds constraints; it has no mechanism to release a
@@ -125,16 +128,27 @@ this full set, per-seed, with medians and > 2σ gating.
 ## Experiment Scope (only these two until one shows signal)
 
 ### Experiment 1 — Does the lock do anything?
-**Question:** Does the M state machinery (asymptotic lock, bimodal distribution) add
-value over raw diagonal Fisher when both use the *same* gradient-derived importance
-signal?
+**Question:** Does the M state machinery (asymptotic soft consolidation lock, bimodal
+distribution) add value over raw diagonal Fisher when both use the *same*
+gradient-derived importance signal?
 
-- **Design:** gradient-aligned M (EWC signal + lock) **vs** raw diagonal Fisher, holding
-  the importance signal identical so the *only* variable is the lock.
-- **Benchmark:** TRACE (standard CL-for-LLMs). Not a synthetic permuted-vocab toy.
-- **Arms:** gradient_aligned_m, EWC/Fisher, + mandatory baselines. n ≥ 5 seeds, full λ sweep.
-- **Relevant win:** M's Pareto frontier dominates Fisher's by > 2σ BWT at matched target
-  accuracy over a contiguous λ region.
+- **Design (Phase-1 isolation screen):** `gradient_aligned_m` (same signal + asymptotic
+  soft lock, **task-boundary** M build) **vs** `raw_fisher_signal` (same signal, no lock).
+  The *only* structural variable is `use_asymptotic_lock`. This is an isolation screen,
+  not a claim of continuous-during-training consolidation.
+- **Phase-2 arm (registered, not default matrix):** `gradient_aligned_m_online` updates
+  M/lock from `on_step` so consolidation is continuous and activity-dependent.
+- **Dependent variable (Phase 1):** **BWT under a uniform next-token-accuracy (NTA)
+  proxy** (pad-masked). Faithful per-task TRACE metrics (accuracy / ROUGE-L / SARI /
+  edit_sim) are deferred to Phase 2. Records carry `metric_scope: "nta_proxy"`.
+- **Benchmark:** TRACE task sequence (standard CL-for-LLMs data). Not a synthetic toy.
+- **Arms:** gradient_aligned_m, raw_fisher_signal, cumulative EWC, + mandatory baselines.
+  n ≥ 5 seeds, full λ sweep. Weight-space knobs (`rho`, `alpha`) are fixed after a short
+  `--tune-baselines` pre-study — not swept in the main matrix.
+- **M is not cumulative across tasks** the way online-EWC Fisher is; multi-task
+  consolidation for M is carried by the asymptotic lock dynamics (the IV under test).
+- **Relevant win:** all README relevance criteria in `decide()` (beat control, beat EWC,
+  beat a weight-space method, matched plasticity, contiguous λ region).
 - **If it fails:** the lock is inert. Half the kill criterion is met.
 
 ### Experiment 2 — Does demyelination beat ossification?

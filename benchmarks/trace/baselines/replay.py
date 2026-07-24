@@ -43,30 +43,52 @@ class ReplayArm(Arm):
         self._torch = __import__("torch")
 
     def _ce_loss_on_sample(self, model, sample):
-        torch = self._torch
-        input_ids = sample.unsqueeze(0) if sample.dim() == 1 else sample
-        input_ids = input_ids.to(next(model.parameters()).device)
-        out = model(input_ids, labels=input_ids)
+        from synthetic_myelination import unpack_lm_batch
+        device = next(model.parameters()).device
+        if isinstance(sample, dict):
+            batch = {
+                "input_ids": sample["input_ids"].unsqueeze(0)
+                if sample["input_ids"].dim() == 1 else sample["input_ids"],
+            }
+            if "attention_mask" in sample:
+                am = sample["attention_mask"]
+                batch["attention_mask"] = (
+                    am.unsqueeze(0) if am.dim() == 1 else am
+                )
+        else:
+            ids = sample.unsqueeze(0) if sample.dim() == 1 else sample
+            batch = ids
+        input_ids, labels, attention_mask = unpack_lm_batch(
+            batch, device, pad_token_id=self._cfg.get("pad_token_id"),
+        )
+        try:
+            out = model(
+                input_ids, labels=labels, attention_mask=attention_mask,
+            )
+        except TypeError:
+            out = model(input_ids, labels=labels)
         return out.loss
 
     def aux_loss(self, model):
         if not self._buffer:
             return None
-        torch = self._torch
         k = min(self.replay_batch, len(self._buffer))
         picks = self._rng.sample(self._buffer, k)
         losses = [self._ce_loss_on_sample(model, s) for s in picks]
         return self.lambda_reg * (sum(losses) / len(losses))
 
     def on_step(self, model, step: int, batch) -> None:
-        # reservoir-sample the raw examples in this batch into the buffer
-        torch = self._torch
+        # reservoir-sample examples (ids + mask) into the buffer
         if isinstance(batch, dict):
             ids = batch["input_ids"]
+            mask = batch.get("attention_mask")
         else:
             ids = batch
+            mask = None
         for i in range(ids.shape[0]):
-            ex = ids[i].detach().cpu().clone()
+            ex = {"input_ids": ids[i].detach().cpu().clone()}
+            if mask is not None:
+                ex["attention_mask"] = mask[i].detach().cpu().clone()
             self._seen += 1
             if len(self._buffer) < self.buffer_size:
                 self._buffer.append(ex)

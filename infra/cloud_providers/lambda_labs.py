@@ -285,7 +285,7 @@ class LambdaProvider(CloudProvider):
             f"SSH-ready within {timeout_s}s"
         )
 
-    def destroy(self, instance: CloudInstance) -> None:
+    def destroy(self, instance: CloudInstance) -> bool:
         assert isinstance(instance, LambdaInstance)
         try:
             r = requests.post(
@@ -301,12 +301,15 @@ class LambdaProvider(CloudProvider):
                     f"{r.text[:200]!r}",
                     flush=True,
                 )
+                return False
+            return True
         except requests.RequestException as exc:
             print(
                 f"!! Failed to terminate Lambda instance "
                 f"{instance.instance_id}: {exc}",
                 flush=True,
             )
+            return False
 
     # ---- Internal helpers ---------------------------------------------------
 

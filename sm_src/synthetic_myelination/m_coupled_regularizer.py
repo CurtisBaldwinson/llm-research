@@ -300,6 +300,7 @@ def estimate_fisher_diagonal(
     dataloader,
     n_steps: int = 200,
     device: Optional[torch.device] = None,
+    pad_token_id: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     """Estimate the diagonal Fisher information for trainable params.
 
@@ -312,7 +313,11 @@ def estimate_fisher_diagonal(
       - Model is set to eval mode for stability; gradients still flow.
       - Per-tensor normalization to [0, 1] makes Fisher and M
         comparable in magnitude.
+      - Pad positions are excluded via labels=-100 / attention_mask so
+        padding never contributes to the importance signal.
     """
+    from .batch_utils import unpack_lm_batch
+
     if device is None:
         device = next(model.parameters()).device
 
@@ -330,15 +335,17 @@ def estimate_fisher_diagonal(
         for step, batch in enumerate(dataloader):
             if step >= n_steps:
                 break
-            # Batch is expected to be input_ids; standard CE loss for fisher
-            if isinstance(batch, dict):
-                input_ids = batch["input_ids"].to(device)
-            elif isinstance(batch, torch.Tensor):
-                input_ids = batch.to(device)
-            else:
-                input_ids = torch.tensor(batch, device=device)
-
-            outputs = model(input_ids, labels=input_ids)
+            input_ids, labels, attention_mask = unpack_lm_batch(
+                batch, device, pad_token_id=pad_token_id,
+            )
+            try:
+                outputs = model(
+                    input_ids,
+                    labels=labels,
+                    attention_mask=attention_mask,
+                )
+            except TypeError:
+                outputs = model(input_ids, labels=labels)
             loss = outputs.loss
             model.zero_grad(set_to_none=True)
             loss.backward()

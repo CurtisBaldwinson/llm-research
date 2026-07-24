@@ -49,9 +49,11 @@ class MyelinState:
     where A is broadcast to the parameter shape if supplied as a scalar.
 
     v2 extensions (all OFF by default, backward-compatible):
-      - Asymptotic lock (``use_asymptotic_lock``): once M stays >= theta_retain
-        for ``lock_consec_steps`` consecutive steps, the per-parameter floor
-        is raised to theta_retain so M cannot decay below it.
+      - Asymptotic soft consolidation lock (``use_asymptotic_lock``): once M
+        stays >= theta_retain for ``lock_consec_steps`` consecutive steps,
+        the per-parameter floor is raised to theta_retain so M cannot decay
+        below it. This raises the *penalty weight floor* in the regularizer
+        path — it is **not** a hard freeze / gradient gate.
       - Participation gate (``use_participation_gate``): skip the M update
         entirely for parameters whose mean activity is below
         ``tau_relevance``.
@@ -215,7 +217,17 @@ class MyelinState:
                     self._M_floor[k] = v.to(self.device).float()
         if "consec_above_retain" in sd:
             for k, v in sd["consec_above_retain"].items():
-                if k in self._consec_above_retain:
+                if k not in self._consec_above_retain:
+                    continue
+                if torch.is_tensor(v):
+                    self._consec_above_retain[k] = v.to(
+                        self.device, dtype=torch.long
+                    )
+                elif torch.is_tensor(self._consec_above_retain[k]):
+                    self._consec_above_retain[k] = torch.as_tensor(
+                        v, dtype=torch.long, device=self.device
+                    )
+                else:
                     self._consec_above_retain[k] = int(v)
         self.alpha = float(sd.get("alpha", self.alpha))
         self.beta = float(sd.get("beta", self.beta))
@@ -306,7 +318,7 @@ class MyelinState:
             if self.use_asymptotic_lock:
                 consec = self._consec_above_retain[name]
                 if torch.is_tensor(consec):
-                    # v5: per-neuron tensor lock
+                    # v5: per-neuron tensor lock (soft penalty floor raise)
                     above = (new_M >= self.theta_retain)
                     new_consec = torch.where(
                         above,
@@ -315,10 +327,15 @@ class MyelinState:
                     )
                     self._consec_above_retain[name] = new_consec
                     lock_mask = new_consec >= self.lock_consec_steps
+                    prev_floor = self._M_floor[name]
+                    newly_locked = lock_mask & (
+                        prev_floor < (self.theta_retain - 1e-9)
+                    )
+                    self.lock_activations += int(newly_locked.sum().item())
                     self._M_floor[name] = torch.where(
                         lock_mask,
-                        torch.full_like(self._M_floor[name], self.theta_retain),
-                        self._M_floor[name]
+                        torch.full_like(prev_floor, self.theta_retain),
+                        prev_floor,
                     )
                 else:
                     # Original scalar lock logic (backward compat)

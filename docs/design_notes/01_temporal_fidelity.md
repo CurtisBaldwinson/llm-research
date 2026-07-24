@@ -49,14 +49,19 @@ reinforcement integral. The intuition is correct on the mechanics.
 
     M ← clamp(M + α·A − β·(1 − A),  0, 1)
 
-with an **asymptotic lock**: a neuron whose M stays above `theta_retain`
-for `lock_consec_steps` consecutive steps is latched (discrete, bimodal
-plasticity). This has exactly the property EWC lacks:
+with an **asymptotic (soft, penalty-based) consolidation lock**: a neuron
+whose M stays above `theta_retain` for `lock_consec_steps` consecutive steps
+has its M floor raised (discrete, bimodal plasticity in the *importance
+weight*). This is **not** a hard parameter freeze or gradient gate —
+`apply_gate` is out of scope for Phase 1. It still has the property EWC
+lacks in the importance signal:
 
-- It is a **temporal integral** of activity, not a single-instant sample.
+- It is a **temporal integral** of activity, not a single-instant sample
+  (when driven from `on_step`; see Phase-1 vs Phase-2 arms below).
 - It is **path-dependent**: the lock can only fire after *sustained*
   reinforcement, so history matters.
-- The lock is a **discrete consolidation event**, not a smooth stiffness.
+- The lock is a **discrete consolidation event on the penalty weight**, not
+  a smooth stiffness and not a hard freeze.
 
 So the M state machine is, by construction, closer to "myelination over
 time" than Fisher is. **We already built the less-reduced model.** That is
@@ -86,24 +91,41 @@ measurable. Biological faithfulness is not a result.
 
 ## 4. What Experiment 1 tests (and why it is the right test)
 
-Experiment 1 isolates the *one* difference between the snapshot view and
-the temporal view, holding everything else identical:
+### Phase-1 isolation screen (default matrix)
 
-- **Importance signal held identical across both arms.** Both the M arm and
-  the Fisher arm use the same `grad_l2_per_neuron` gradient-aligned signal.
-  This removes "M vs Fisher as importance signals" as a confound — the v1
-  work already conflated the signal choice with the mechanism.
-- **The only thing that varies is the lock** (discrete temporal
-  consolidation) vs. **raw diagonal Fisher** (instantaneous snapshot).
-- Metric: **Backward Transfer (BWT)** on the TRACE task sequence at matched
-  plasticity. A defensible win is a BWT improvement that clears the
-  relevance bar in the README (beats BOTH Fisher/EWC and a weight-space
-  method; > 2× per-seed σ at n ≥ 5; Pareto-frontier dominance over a
-  contiguous λ region; survives cost adjustment).
+Isolates the *one* difference between lock-on and lock-off, holding
+everything else identical:
 
-If the temporal lock is a real improvement over the instantaneous snapshot,
-**this is the experiment that shows it** — cleanly, with nothing else moving.
-If it is not, the pre-registered kill criterion applies.
+- **Importance signal held identical across both arms.** Both
+  `gradient_aligned_m` and `raw_fisher_signal` use `grad_l2_per_neuron`.
+- **M is built at the task boundary** via a short post-task integral (not
+  online during SGD). Same penalty form, same re-anchor schedule.
+- **The only structural variable is `use_asymptotic_lock`.**
+- **Lock kind:** asymptotic (soft, penalty-based) consolidation — raises the
+  M floor used as quadratic penalty weight. Not a hard freeze.
+- **M is not cumulative across tasks** the way online-EWC Fisher is; that
+  difference is intentional (lock dynamics are the IV, not a baseline to
+  standardize onto EWC accumulation).
+- **Dependent variable:** BWT under a **uniform next-token-accuracy (NTA)
+  proxy** (pad-masked). Faithful TRACE task metrics are Phase 2.
+
+### Phase-2 continuous arm (registered: `gradient_aligned_m_online`)
+
+Commits the temporal claim properly: live `MyelinState` + `ActivityCapture`,
+`myelin.update` from `on_step`, so `lock_consec_steps` counts real training
+steps under sustained activity. Still soft-penalty lock (no `apply_gate`).
+
+### Classical floor
+
+`EWCArm` uses **cumulative (online) Fisher** across tasks — the literature
+comparison. Do not confuse it with `raw_fisher_signal` (isolation control).
+
+### Relevance
+
+A defensible win clears all criteria in `decide()` (control 2σ, EWC floor,
+weight-space method, matched plasticity, contiguous λ region; cost at report
+time). If the lock fails the isolation screen **and** the online arm, the
+pre-registered kill criterion applies.
 
 ## 5. Pre-training as a myelin scaffold — deferred, and why
 

@@ -17,6 +17,7 @@ to an M/Fisher penalty — that is the whole point of the "beats a weight-space
 method too" relevance criterion.
 """
 
+from .base import Arm, DegenerateSignalError
 from .ewc import EWCArm, VanillaArm
 from .elastic_reset import ElasticResetArm
 from .model_averaging import ModelAveragingArm
@@ -31,6 +32,11 @@ MANDATORY_BASELINES = [
     "replay",
 ]
 
+# Fixed after the weight-space pre-study (see run.py --tune-baselines).
+# Do not sweep these in the main Exp 1 matrix.
+DEFAULT_ELASTIC_RESET_RHO = 0.5
+DEFAULT_MODEL_AVERAGING_ALPHA = 0.5
+
 ARM_REGISTRY = {
     "vanilla": VanillaArm,
     "ewc": EWCArm,
@@ -42,9 +48,13 @@ ARM_REGISTRY = {
 __all__ = [
     "MANDATORY_BASELINES",
     "ARM_REGISTRY",
+    "Arm",
+    "DegenerateSignalError",
     "VanillaArm",
     "EWCArm",
     "ElasticResetArm",
     "ModelAveragingArm",
     "ReplayArm",
+    "DEFAULT_ELASTIC_RESET_RHO",
+    "DEFAULT_MODEL_AVERAGING_ALPHA",
 ]

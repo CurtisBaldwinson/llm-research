@@ -321,15 +321,20 @@ class RunPodProvider(CloudProvider):
             f"Pod {instance.pod_id} did not become SSH-ready within {timeout_s}s"
         )
 
-    def destroy(self, instance: CloudInstance) -> None:
+    def destroy(self, instance: CloudInstance) -> bool:
         assert isinstance(instance, RunPodInstance)
         try:
             self._delete(f"/pods/{instance.pod_id}", timeout=30)
+            return True
         except _RunPodApiError as exc:
+            # 404 = already gone (e.g. pod_finalize self-terminated). Success.
+            if getattr(exc, "status_code", None) == 404:
+                return True
             print(
                 f"!! Failed to delete RunPod pod {instance.pod_id}: {exc}",
                 flush=True,
             )
+            return False
 
     def attach_from_provisioning(self, prov: Dict[str, Any]) -> RunPodInstance:
         """Reconstruct a live RunPodInstance from a persisted provisioning dict.
@@ -415,7 +420,8 @@ class RunPodProvider(CloudProvider):
         r = requests.delete(
             f"{REST_API}{path}", headers=self._headers(), timeout=timeout,
         )
-        if r.status_code not in (200, 202, 204):
+        # 404 = already gone (pod_finalize self-terminate race); treat as OK.
+        if r.status_code not in (200, 202, 204, 404):
             raise _RunPodApiError(
                 status_code=r.status_code, body=r.text or "", path=path
             )
@@ -430,10 +436,15 @@ class RunPodProvider(CloudProvider):
             "} }" % pod_id
         )
         try:
+            # Prefer Authorization header (REST already does this). Putting
+            # api_key in the query string leaks into proxy/APM access logs.
             r = requests.post(
-                f"{GRAPHQL_API}?api_key={self._api_key}",
+                GRAPHQL_API,
                 json={"query": query},
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self._api_key}",
+                },
                 timeout=30,
             )
             if r.status_code != 200:

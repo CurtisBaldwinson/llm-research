@@ -3,7 +3,7 @@
 
 Each arm gets:
 
-  - its own detached `python3 scripts/run_on_cloud.py ...` process
+  - its own detached `python3 infra/run_on_cloud.py ...` process
     (start_new_session=True; survives terminal close)
   - its own GPU pod (independent provisioning, independent SSH)
   - its own staging dir under lab_reports/_staging/<bench>_results_<ts>/
@@ -16,14 +16,12 @@ metadata).
 
 Usage (a Makefile target should be the typical caller):
 
-  python3 scripts/launch_parallel_sweep.py \
-      --name imp05_v20_pp9_lambda \
-      --benchmark 05_m_coupled_kl_rlhf \
+  python3 infra/launch_parallel_sweep.py \
+      --name exp1_trace_arms \
+      --benchmark trace \
       --provider runpod \
       --cloud SECURE \
-      --values 0.001 0.01 0.03 0.1 \
-      --extra-args-template \
-        '--v2_mode --alpha_preset uniform --lambda_reg {value} --seeds 42 --conditions M_coupled_DPO vanilla_DPO'
+      --arm-spec /tmp/trace_arms.json
 
 The --extra-args-template string is `str.format(value=...)`-substituted
 once per arm.  Use `{value}` exactly once to mark the swept slot.
@@ -113,6 +111,14 @@ def main() -> int:
         default=2.0,
         help="seconds between consecutive arm launches (default 2.0)",
     )
+    parser.add_argument(
+        "--max-arms",
+        type=int,
+        default=20,
+        help="hard cap on parallel arms (default 20). Refuses to launch "
+             "if the arm-spec/values list exceeds this; protects against "
+             "accidental open-wallet fan-out.",
+    )
     args = parser.parse_args()
 
     # Validate the two dispatch modes are mutually exclusive and one is supplied.
@@ -131,9 +137,12 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+    if args.max_arms < 1:
+        print("ERROR: --max-arms must be >= 1.", file=sys.stderr)
+        return 2
 
     repo_root = Path(__file__).resolve().parents[1]
-    cloud_script = repo_root / "scripts" / "run_on_cloud.py"
+    cloud_script = repo_root / "infra" / "run_on_cloud.py"
     if not cloud_script.exists():
         print(f"ERROR: dispatcher not found at {cloud_script}", file=sys.stderr)
         return 2
@@ -165,6 +174,14 @@ def main() -> int:
                 "slug": _slugify_value(value),
                 "extra_args": args.extra_args_template.format(value=value),
             })
+
+    if len(arm_inputs) > args.max_arms:
+        print(
+            f"ERROR: arm count {len(arm_inputs)} exceeds --max-arms={args.max_arms}. "
+            f"Raise the cap explicitly if this fan-out is intentional.",
+            file=sys.stderr,
+        )
+        return 2
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     sweep_dir = repo_root / "lab_reports" / "_staging" / "_logs" / f"{args.name}_{stamp}"

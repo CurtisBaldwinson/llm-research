@@ -38,10 +38,11 @@ TRACE_TASK_ORDER = [
     "NumGLUE-ds",
 ]
 
-# Per-task primary metric (paper Table). Accuracy tasks use exact-match on the
-# generated answer; generation tasks (summarization / simplification) fall back
-# to token-level next-token accuracy as a cheap proxy in the harness and are
-# scored with their proper metric (ROUGE-L / SARI) in eval/ at report time.
+# Per-task primary metric from the TRACE paper. Phase 1 does NOT use these
+# for the dependent variable — Exp 1 reports BWT under a uniform
+# next-token-accuracy (NTA) proxy (see eval/metrics.py METRIC_SCOPE).
+# Faithful per-task scoring is deferred to Phase 2; this map is kept so
+# Phase 2 can wire task-correct metrics without rediscovering the table.
 TRACE_TASK_METRIC = {
     "ScienceQA": "accuracy",
     "FOMC": "accuracy",
@@ -52,6 +53,8 @@ TRACE_TASK_METRIC = {
     "NumGLUE-cm": "accuracy",
     "NumGLUE-ds": "accuracy",
 }
+
+PHASE1_METRIC_SCOPE = "nta_proxy"
 
 
 def _read_json_records(path: Path) -> List[dict]:
@@ -66,15 +69,20 @@ def _read_json_records(path: Path) -> List[dict]:
 
 
 def _tokenize_examples(records, tokenizer, max_len: int, n_cap: int):
-    """Turn {prompt, answer} records into padded input_id tensors.
+    """Turn {prompt, answer} records into padded input_ids + attention_mask.
 
     The training target is the full prompt+answer sequence (standard
-    instruction-tuning next-token objective). Returns a single 2-D LongTensor
-    [N, max_len]; the harness batches it.
+    instruction-tuning next-token objective). Returns
+    ``(input_ids [N, max_len], attention_mask [N, max_len])``.
+
+    Pad positions are identified solely via ``attention_mask`` (critical when
+    ``pad_token_id == eos_token_id``). The harness sets labels=-100 on mask==0
+    so padding never enters loss, Fisher, or M signals.
     """
     import torch
 
     ids = []
+    masks = []
     for rec in records[:n_cap]:
         prompt = str(rec.get("prompt", ""))
         answer = str(rec.get("answer", ""))
@@ -87,18 +95,23 @@ def _tokenize_examples(records, tokenizer, max_len: int, n_cap: int):
             return_tensors="pt",
         )
         ids.append(enc["input_ids"][0])
+        masks.append(enc["attention_mask"][0])
     if not ids:
-        return torch.zeros((0, max_len), dtype=torch.long)
-    return torch.stack(ids, dim=0)
+        z = torch.zeros((0, max_len), dtype=torch.long)
+        return z, z.clone()
+    return torch.stack(ids, dim=0), torch.stack(masks, dim=0)
 
 
-def _batched(tensor, batch_size: int):
-    """Yield row-batches from a 2-D tensor (list of tensors, harness-friendly)."""
+def _batched_pairs(ids, mask, batch_size: int):
+    """Yield dict batches ``{input_ids, attention_mask}`` for the harness."""
     out = []
     i = 0
-    n = tensor.shape[0]
+    n = ids.shape[0]
     while i < n:
-        out.append(tensor[i:i + batch_size])
+        out.append({
+            "input_ids": ids[i:i + batch_size],
+            "attention_mask": mask[i:i + batch_size],
+        })
         i += batch_size
     return out
 
@@ -133,14 +146,16 @@ def build_trace_sequence(
                 f"Download the official TRACE data "
                 f"(https://github.com/BeyonderXX/TRACE) into {data_root}."
             )
-        train_ids = _tokenize_examples(
+        train_ids, train_mask = _tokenize_examples(
             _read_json_records(train_path), tokenizer, max_len, n_train
         )
-        eval_ids = _tokenize_examples(
+        eval_ids, eval_mask = _tokenize_examples(
             _read_json_records(eval_path), tokenizer, max_len, n_eval
         )
-        sequence.append((_batched(train_ids, batch_size),
-                         _batched(eval_ids, batch_size)))
+        sequence.append((
+            _batched_pairs(train_ids, train_mask, batch_size),
+            _batched_pairs(eval_ids, eval_mask, batch_size),
+        ))
     return sequence
 
 
