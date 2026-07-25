@@ -40,6 +40,10 @@ from baselines.base import Arm, DegenerateSignalError
 
 
 _SIGNAL_TYPE = "grad_l2_per_neuron"
+# Design Note 02 (2026-07-24): smoothed-rank signal normalization makes the
+# protected fraction distribution-invariant. "rank" routes the per-neuron
+# signal through EMA-then-fractional-rank in ActivityCapture._get_signals_per_neuron.
+_NORMALIZATION = "rank"
 
 
 class _SignalRegArmBase(Arm):
@@ -142,6 +146,7 @@ class GradientAlignedMArm(_SignalRegArmBase):
             lock_consec_steps=self.lock_consec_steps,
             theta_retain=self.theta_retain,
             signal_type=_SIGNAL_TYPE,
+            normalization=_NORMALIZATION,
         )
         _accumulate_signal_into_M(
             model, task_loader, myelin, self._torch_ref(),
@@ -199,6 +204,7 @@ class RawFisherSignalArm(_SignalRegArmBase):
             beta=self.beta,
             use_asymptotic_lock=False,   # <-- the only structural difference
             signal_type=_SIGNAL_TYPE,
+            normalization=_NORMALIZATION,
         )
         _accumulate_signal_into_M(
             model, task_loader, myelin, self._torch_ref(),
@@ -279,6 +285,7 @@ class GradientAlignedMOnlineArm(_SignalRegArmBase):
             lock_consec_steps=self.lock_consec_steps,
             theta_retain=self.theta_retain,
             signal_type=_SIGNAL_TYPE,
+            normalization=_NORMALIZATION,
         )
         self._reg = None
         self._step_updates = 0
@@ -287,7 +294,7 @@ class GradientAlignedMOnlineArm(_SignalRegArmBase):
         if self._capture is not None:
             self._capture.remove()
             self._capture = None
-        self._capture = self._ActivityCapture(model, signal_type=_SIGNAL_TYPE)
+        self._capture = self._ActivityCapture(model, signal_type=_SIGNAL_TYPE, normalization=_NORMALIZATION)
         self._capture.register()
 
     def on_step(self, model, step: int, batch) -> None:
@@ -351,7 +358,7 @@ def _accumulate_signal_into_M(
     """
     from synthetic_myelination import ActivityCapture, unpack_lm_batch
 
-    capture = ActivityCapture(model, signal_type=_SIGNAL_TYPE)
+    capture = ActivityCapture(model, signal_type=_SIGNAL_TYPE, normalization=_NORMALIZATION)
     capture.register()
     was_training = model.training
     model.train()

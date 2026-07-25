@@ -60,6 +60,24 @@ _PER_NEURON_SIGNAL_TYPES = frozenset({
 })
 
 
+def _fractional_rank_1d(x: Tensor) -> Tensor:
+    """Map a 1-D tensor to per-element fractional ranks in (0, 1].
+
+    Smallest element -> 1/N, largest -> N/N = 1.0. Ties resolved by stable
+    sort order. Result is ~uniform on (0, 1] regardless of the input
+    distribution's shape, so the fraction of elements above any threshold tau
+    is ~= (1 - tau) independent of the input tail. See Design Note 02.
+    """
+    n = x.numel()
+    if n <= 1:
+        return torch.ones_like(x)
+    order = torch.argsort(x, dim=0)          # indices that sort ascending
+    ranks = torch.empty_like(x, dtype=torch.float32)
+    fill = torch.arange(1, n + 1, dtype=torch.float32, device=x.device) / float(n)
+    ranks[order] = fill
+    return ranks
+
+
 def _rank_normalize(signals: dict[str, float]) -> dict[str, float]:
     """Within each layer group (module prefix), replace values by fractional rank.
 
@@ -511,8 +529,18 @@ class ActivityCapture:
         """Per-neuron EMA for Tensor[H] signal modes.
 
         Used by both ``activation_l2`` and ``grad_l2_per_neuron``.  The hook
-        already applied per-tensor normalization to [0, 1]; this method only
-        applies the EMA smoothing controlled by ``ema_window``.
+        already applied per-tensor magnitude normalization to [0, 1]; this
+        method applies EMA smoothing (``ema_window``) and, when
+        ``normalization == "rank"``, a per-neuron **smoothed-rank** reshape.
+
+        Smoothed-rank (Design Note 02, 2026-07-24): after EMA, replace each
+        neuron's value by its fractional rank within the tensor, so the signal
+        A is ~uniform on (0, 1] **by construction**. This makes the fraction of
+        neurons above the M-update break-even threshold ~= (1 - break-even),
+        *independent of the gradient distribution's tail*. It reshapes the
+        input signal only; the continuous, activity-dependent M-accumulation
+        dynamics are unchanged. EMA is applied BEFORE ranking so the ordering
+        reflects sustained importance over time, not single-step gradient noise.
         """
         ema_alpha = 2.0 / (self.ema_window + 1) if self.ema_window > 1 else 1.0
 
@@ -537,6 +565,11 @@ class ActivityCapture:
                     smoothed = ema_alpha * A + (1.0 - ema_alpha) * prev
                     self._ema[name] = smoothed
                     A = smoothed
+            # Smoothed-rank reshape (opt-in via normalization="rank"): map the
+            # EMA-smoothed per-neuron signal to fractional ranks in (0, 1].
+            # Distribution-invariant protected fraction; see Design Note 02.
+            if self.normalization == "rank" and A.ndim >= 1 and A.numel() > 1:
+                A = _fractional_rank_1d(A)
             out[name] = A
         return out
 
