@@ -90,7 +90,14 @@ def main() -> int:
         print("ERROR: no points in shards", file=sys.stderr)
         return 2
 
-    alpha = float(shards[0].get("alpha", 0.1))
+    alphas = {round(float(s.get("alpha", 0.1)), 9) for s in shards}
+    norms = {s.get("normalization") for s in shards}
+    if len(alphas) > 1 or len(norms) > 1:
+        print(f"ERROR: incompatible shards: alphas={sorted(alphas)} "
+              f"normalizations={sorted(n or '?' for n in norms)}",
+              file=sys.stderr)
+        return 2
+    alpha = alphas.pop()
     taus = sorted({float(p["tau"]) for p in points})
     ema_windows = sorted({int(p["ema_window"]) for p in points})
 
@@ -112,6 +119,15 @@ def main() -> int:
         trace_run, "_row_selectable_for_verdict",
         lambda t: t.get("selectable_for_verdict", False),
     )
+    # One comparator everywhere (per-window + cross-window + run.py recommend).
+    row_key = getattr(trace_run, "_verdict_row_key", None)
+    if row_key is None:
+        def row_key(t):
+            return (
+                int(t["n_mass_split_fail_tasks"]),
+                abs(float(t["protected_frac_mean"]) - 0.5)
+                + 2.0 * float(t["protected_frac_std"]),
+            )
 
     def _best_for_w(w: int):
         if int(w) > max_w:
@@ -122,16 +138,7 @@ def main() -> int:
         ]
         if not rows:
             return None
-
-        def _key(t):
-            # std is guaranteed real by row_ok.
-            return (
-                t["n_mass_split_fail_tasks"],
-                abs(t["protected_frac_mean"] - 0.5)
-                + 2.0 * float(t["protected_frac_std"]),
-            )
-
-        return min(rows, key=_key)
+        return min(rows, key=row_key)
 
     w1 = _best_for_w(1)
     w_on = None
@@ -141,15 +148,8 @@ def main() -> int:
         cand = _best_for_w(w)
         if cand is None:
             continue
-        if w_on is None or (
-            cand["n_mass_split_fail_tasks"],
-            abs(cand["protected_frac_mean"] - 0.5)
-            + 2.0 * float(cand["protected_frac_std"]),
-        ) < (
-            w_on["n_mass_split_fail_tasks"],
-            abs(w_on["protected_frac_mean"] - 0.5)
-            + 2.0 * float(w_on["protected_frac_std"]),
-        ):
+        # Same key as _best_for_w / run._verdict_row_key — never std-first.
+        if w_on is None or row_key(cand) < row_key(w_on):
             w_on = cand
 
     ema_verdict = {

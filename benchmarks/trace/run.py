@@ -801,24 +801,69 @@ def _bt_beta_for_breakeven(alpha: float, tau: float) -> float:
     return alpha * tau / (1.0 - tau)
 
 
+# Cap for BC host transfer: full M is [H] per-neuron (not per-weight), so
+# typically <<1e6; still bound so BC (numpy skew/kurt) never scales with a
+# future per-param signal mode. Mean/frac stats use full-vector torch ops.
+_BT_M_STATS_BC_MAX_ELEMS = 50_000
+
+
 def _bt_m_stats(myelin, bimodality_coefficient) -> Dict:
-    """Distribution-level M stats over non-head params."""
-    vals = []
+    """Distribution-level M stats over non-head params.
+
+    Mean / mass-split fractions: torch reductions on the full concatenated
+    vector (no Python float list). BC: bounded CPU subsample only — Sarle's
+    coefficient is O(n) host numpy and does not need every element.
+
+    Note: with grad_l2_per_neuron, M is per-neuron [H], not per-weight, so
+    this is tens–hundreds of K floats, not gigabytes. Torch reductions are
+    still the right idiom (faster, future-proof if signal_type changes).
+
+    Uses myelin._param_role (private) for head skip — same established
+    internal contract as check_degenerate_M / batch_utils (no public
+    accessor exists; adding one is a separate cleanup across all call sites).
+    """
+    import torch
+
+    flats = []
     for name, M in myelin.M.items():
         if myelin._param_role.get(name, "representation") == "head":
             continue
-        vals.extend(M.flatten().detach().cpu().float().tolist())
-    if not vals:
+        if M is None or not torch.is_tensor(M) or M.numel() == 0:
+            continue
+        flats.append(M.detach().reshape(-1).float())
+    if not flats:
         return dict(n=0, mean_M=None, frac_near_zero=None, frac_locked_hi=None,
                     frac_mid=None, bc=None)
-    n = len(vals)
+
+    # Keep on the tensors' device for reductions; only BC subsample hits host.
+    v = torch.cat(flats)
+    n = int(v.numel())
+    mean_M = float(v.mean().item())
+    frac_near_zero = float((v < 0.01).float().mean().item())
+    frac_locked_hi = float((v > 0.90).float().mean().item())
+    frac_mid = float(((v >= 0.01) & (v <= 0.90)).float().mean().item())
+
+    # Bounded subsample for BC (explicit CPU — never pass a CUDA tensor to
+    # numpy-backed bimodality_coefficient).
+    if n <= _BT_M_STATS_BC_MAX_ELEMS:
+        bc_host = v.detach().cpu()
+    else:
+        # Even stride sample preserves rough mass shape without RNG coupling.
+        step = max(1, n // _BT_M_STATS_BC_MAX_ELEMS)
+        bc_host = v[::step][:_BT_M_STATS_BC_MAX_ELEMS].detach().cpu()
+    try:
+        bc = float(bimodality_coefficient(bc_host.numpy()))
+    except Exception:
+        bc = float("nan")
+
     return dict(
         n=n,
-        mean_M=sum(vals) / n,
-        frac_near_zero=sum(1 for m in vals if m < 0.01) / n,
-        frac_locked_hi=sum(1 for m in vals if m > 0.90) / n,
-        frac_mid=sum(1 for m in vals if 0.01 <= m <= 0.90) / n,
-        bc=bimodality_coefficient(vals),
+        mean_M=mean_M,
+        frac_near_zero=frac_near_zero,
+        frac_locked_hi=frac_locked_hi,
+        frac_mid=frac_mid,
+        bc=bc,
+        bc_n_subsample=int(bc_host.numel()),
     )
 
 
@@ -887,6 +932,24 @@ def _row_selectable_for_verdict(t: dict) -> bool:
     if t.get("protected_frac_std") is None:
         return False
     return True
+
+
+def _verdict_row_key(t: dict) -> tuple:
+    """Single comparator for recommended / per-window / cross-window picks.
+
+    Lower is better:
+      1. fewer mass-split failures
+      2. closer to 50% protected, with std penalty (mean±2σ style)
+
+    Callers must only pass rows that pass ``_row_selectable_for_verdict``
+    (real std guaranteed). Used by ``_build_lookup_and_recommend`` and
+    ``infra/merge_calib_shards.py`` so priority order cannot drift.
+    """
+    return (
+        int(t["n_mass_split_fail_tasks"]),
+        abs(float(t["protected_frac_mean"]) - 0.5)
+        + 2.0 * float(t["protected_frac_std"]),
+    )
 
 
 def _calib_steps_for_window(base_steps: int, ema_window: int) -> int:
@@ -1023,12 +1086,7 @@ def _build_lookup_and_recommend(points, taus, ema_windows, alpha):
     def _score(t):
         if not _row_selectable_for_verdict(t):
             return (1e9,)
-        # Prefer mass-split healthy rows; std is guaranteed real here.
-        return (
-            t["n_mass_split_fail_tasks"],
-            abs(t["protected_frac_mean"] - 0.5)
-            + 2.0 * float(t["protected_frac_std"]),
-        )
+        return _verdict_row_key(t)
 
     healthy = [t for t in table if _row_selectable_for_verdict(t)]
     recommended = min(healthy, key=_score) if healthy else None
