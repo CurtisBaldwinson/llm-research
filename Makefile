@@ -159,6 +159,57 @@ run-parallel: key-$(PROVIDER)
 	 echo "  make tail     # follow dispatcher.log of the most recent arm"; \
 	 echo "  make status   # PID alive? pod info? last poll line?"
 
+## Design Note 02 init-signal calibration, one pod per TRACE task.
+## Each pod runs the full tau x ema_window grid on its task shard.
+## Examples:
+##   make run-parallel-calib BENCH=trace GPU=A40 CLOUD=SECURE
+##   make run-parallel-calib BENCH=trace GPU=A40 NTASKS=8 CALIB_EMA_WINDOWS='1 15 40'
+## After pods finish:
+##   make merge-calib
+NTASKS              ?= 8
+CALIB_TAUS          ?= 0.1 0.2 0.3 0.4 0.5 0.6 0.7
+CALIB_EMA_WINDOWS   ?= 1 5 15 40 80
+CALIB_ALPHA         ?= 0.1
+CALIB_STEPS         ?= 150
+
+.PHONY: run-parallel-calib
+run-parallel-calib: key-$(PROVIDER)
+	@test -n "$(BENCH)" || \
+	    (echo "Usage: make run-parallel-calib BENCH=trace [GPU=A40] [CLOUD=SECURE] [NTASKS=8] [CALIB_TAUS='...'] [CALIB_EMA_WINDOWS='...'] [CALIB_STEPS=150]" && exit 1)
+	@mkdir -p $(ARMSPEC_DIR) $(LOG_DIR)
+	@STAMP=$$(date -u +%Y%m%dT%H%M%SZ); \
+	 SPEC=$(ARMSPEC_DIR)/$(BENCH)_calib_$$STAMP.json; \
+	 $(SCRIPTS_PY) infra/make_calib_armspec.py \
+	     --n-tasks $(NTASKS) --taus $(CALIB_TAUS) \
+	     --ema-windows $(CALIB_EMA_WINDOWS) \
+	     --alpha $(CALIB_ALPHA) --steps $(CALIB_STEPS) \
+	     --extra-flags "--n_tasks $(NTASKS)" --out $$SPEC || exit 1; \
+	 echo ""; \
+	 echo "==> Launching parallel CALIBRATION from $$SPEC"; \
+	 $(SCRIPTS_PY) infra/launch_parallel_sweep.py \
+	     --name $(BENCH)_calib_$$STAMP \
+	     --benchmark $(BENCH) \
+	     --provider $(PROVIDER) \
+	     $(GPU_FLAG) $(CLOUD_FLAG) \
+	     --arm-spec $$SPEC; \
+	 echo ""; \
+	 echo "  make tail / make status"; \
+	 echo "  make merge-calib   # after all shards land"
+
+## Merge calib_signal_shard*.json -> lookup + optional signal_tuning.json
+## Usage: make merge-calib [MERGE_OUT=...] [SIGNAL_TUNING=...]
+MERGE_OUT      ?= lab_reports/_staging/calib_merged.json
+SIGNAL_TUNING  ?= lab_reports/_staging/signal_tuning.json
+.PHONY: merge-calib
+merge-calib:
+	$(SCRIPTS_PY) infra/merge_calib_shards.py \
+	    --glob 'lab_reports/**/calib_signal_shard*.json' \
+	    --out $(MERGE_OUT) \
+	    --write-signal-tuning $(SIGNAL_TUNING)
+	@echo "Merged -> $(MERGE_OUT)"
+	@echo "signal_tuning -> $(SIGNAL_TUNING)  (confirmation_required=true)"
+	@echo "Fleet: EXTRA_FLAGS='--extra-args --signal-tuning-json $(SIGNAL_TUNING)'"
+
 ## Follow the dispatcher.log of the most recent launch.
 tail:
 	@latest=$$(ls -td lab_reports/_staging/*_results_*/ lab_reports/_staging/_smokes/*_results_*/ 2>/dev/null | head -n1); \

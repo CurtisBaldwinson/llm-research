@@ -45,6 +45,55 @@ _SIGNAL_TYPE = "grad_l2_per_neuron"
 # signal through EMA-then-fractional-rank in ActivityCapture._get_signals_per_neuron.
 _NORMALIZATION = "rank"
 
+# Defaults before signal_tuning.json is loaded (stale τ≈0.33 if β stays 0.05).
+_DEFAULT_ALPHA = 0.1
+_DEFAULT_BETA = 0.05
+_DEFAULT_EMA_WINDOW = 1
+
+
+def load_signal_tuning(path=None) -> dict:
+    """Load signal_tuning.json (calib → arm autowire). Empty dict if absent."""
+    import json
+    import os
+    from pathlib import Path
+
+    candidates = []
+    if path is not None:
+        candidates.append(Path(path))
+    env = os.environ.get("SYNTH_SIGNAL_TUNING")
+    if env:
+        candidates.append(Path(env))
+    cwd = Path.cwd()
+    candidates.extend([
+        cwd / "results" / "signal_tuning.json",
+        cwd / "signal_tuning.json",
+        Path(__file__).resolve().parent / "signal_tuning.json",
+    ])
+    for p in candidates:
+        try:
+            if p.is_file():
+                data = json.loads(p.read_text())
+                if isinstance(data, dict):
+                    data = dict(data)
+                    data["_loaded_from"] = str(p.resolve())
+                    return data
+        except Exception:
+            continue
+    return {}
+
+
+def _apply_signal_tuning(arm, tuning: dict) -> None:
+    """Overwrite alpha/beta/ema_window from calib recommendation when present."""
+    if not tuning:
+        return
+    if "alpha" in tuning:
+        arm.alpha = float(tuning["alpha"])
+    if "beta" in tuning:
+        arm.beta = float(tuning["beta"])
+    if "ema_window" in tuning:
+        arm.ema_window = int(tuning["ema_window"])
+    arm._signal_tuning_source = tuning.get("_loaded_from")
+
 
 class _SignalRegArmBase(Arm):
     """Shared machinery: gradient-aligned per-neuron signal + re-anchoring."""
@@ -57,6 +106,16 @@ class _SignalRegArmBase(Arm):
         self._myelin = None
         self._pad_token_id = kw.get("pad_token_id", None)
         self._consolidation_mode = "task_boundary_isolation_screen"
+        self.ema_window = int(kw.get("ema_window", _DEFAULT_EMA_WINDOW))
+        self._signal_tuning_source = None
+        # Optional explicit dict from harness; else try load_signal_tuning().
+        st = kw.get("signal_tuning")
+        if st is None and kw.get("signal_tuning_json"):
+            st = load_signal_tuning(kw.get("signal_tuning_json"))
+        elif st is None and kw.get("load_signal_tuning", True):
+            st = load_signal_tuning()
+        if st:
+            _apply_signal_tuning(self, st)
 
     def on_train_start(self, model) -> None:
         from synthetic_myelination import (
@@ -120,15 +179,20 @@ class GradientAlignedMArm(_SignalRegArmBase):
         lambda_reg: float = 0.1,
         lock_consec_steps: int = 20,
         theta_retain: float = 0.9,
-        alpha: float = 0.1,
-        beta: float = 0.05,
+        alpha: float = _DEFAULT_ALPHA,
+        beta: float = _DEFAULT_BETA,
+        ema_window: int = _DEFAULT_EMA_WINDOW,
         **kw,
     ):
+        kw.setdefault("ema_window", ema_window)
         super().__init__(lambda_reg=lambda_reg, **kw)
         self.lock_consec_steps = int(lock_consec_steps)
         self.theta_retain = float(theta_retain)
-        self.alpha = float(alpha)
-        self.beta = float(beta)
+        # signal_tuning (if loaded in base) already overwrote alpha/beta/ema.
+        if not getattr(self, "_signal_tuning_source", None):
+            self.alpha = float(alpha)
+            self.beta = float(beta)
+            self.ema_window = int(ema_window)
         self._consolidation_mode = "task_boundary_isolation_screen"
 
     def on_task_end(self, model, task_idx: int, task_loader) -> None:
@@ -147,10 +211,12 @@ class GradientAlignedMArm(_SignalRegArmBase):
             theta_retain=self.theta_retain,
             signal_type=_SIGNAL_TYPE,
             normalization=_NORMALIZATION,
+            ema_window=self.ema_window,
         )
         _accumulate_signal_into_M(
             model, task_loader, myelin, self._torch_ref(),
             pad_token_id=self._pad_token_id,
+            ema_window=self.ema_window,
         )
         self._assert_m_ok(myelin, task_idx)
         self._myelin = myelin
@@ -177,6 +243,9 @@ class GradientAlignedMArm(_SignalRegArmBase):
             "m_distribution_warnings": list(self._m_distribution_warnings),
             "signal_health": "ok",
             "importance_kind": "M",
+            "ema_window": self.ema_window,
+            "normalization": _NORMALIZATION,
+            "signal_tuning_source": self._signal_tuning_source,
         })
         return t
 
@@ -190,11 +259,15 @@ class RawFisherSignalArm(_SignalRegArmBase):
 
     name = "raw_fisher_signal"
 
-    def __init__(self, lambda_reg: float = 0.1, alpha: float = 0.1,
-                 beta: float = 0.05, **kw):
+    def __init__(self, lambda_reg: float = 0.1, alpha: float = _DEFAULT_ALPHA,
+                 beta: float = _DEFAULT_BETA, ema_window: int = _DEFAULT_EMA_WINDOW,
+                 **kw):
+        kw.setdefault("ema_window", ema_window)
         super().__init__(lambda_reg=lambda_reg, **kw)
-        self.alpha = float(alpha)
-        self.beta = float(beta)
+        if not getattr(self, "_signal_tuning_source", None):
+            self.alpha = float(alpha)
+            self.beta = float(beta)
+            self.ema_window = int(ema_window)
         self._consolidation_mode = "task_boundary_isolation_screen"
 
     def on_task_end(self, model, task_idx: int, task_loader) -> None:
@@ -205,10 +278,12 @@ class RawFisherSignalArm(_SignalRegArmBase):
             use_asymptotic_lock=False,   # <-- the only structural difference
             signal_type=_SIGNAL_TYPE,
             normalization=_NORMALIZATION,
+            ema_window=self.ema_window,
         )
         _accumulate_signal_into_M(
             model, task_loader, myelin, self._torch_ref(),
             pad_token_id=self._pad_token_id,
+            ema_window=self.ema_window,
         )
         self._assert_m_ok(myelin, task_idx)
         # Static snapshot of the gradient-aligned importance — no further
@@ -237,6 +312,9 @@ class RawFisherSignalArm(_SignalRegArmBase):
             # Importance diagonal is M (same hard-check set as Fisher);
             # not estimate_fisher_diagonal — isolation control for the lock.
             "importance_kind": "M_as_static_diagonal",
+            "ema_window": self.ema_window,
+            "normalization": _NORMALIZATION,
+            "signal_tuning_source": self._signal_tuning_source,
         })
         return t
 
@@ -260,15 +338,19 @@ class GradientAlignedMOnlineArm(_SignalRegArmBase):
         lambda_reg: float = 0.1,
         lock_consec_steps: int = 20,
         theta_retain: float = 0.9,
-        alpha: float = 0.1,
-        beta: float = 0.05,
+        alpha: float = _DEFAULT_ALPHA,
+        beta: float = _DEFAULT_BETA,
+        ema_window: int = _DEFAULT_EMA_WINDOW,
         **kw,
     ):
+        kw.setdefault("ema_window", ema_window)
         super().__init__(lambda_reg=lambda_reg, **kw)
         self.lock_consec_steps = int(lock_consec_steps)
         self.theta_retain = float(theta_retain)
-        self.alpha = float(alpha)
-        self.beta = float(beta)
+        if not getattr(self, "_signal_tuning_source", None):
+            self.alpha = float(alpha)
+            self.beta = float(beta)
+            self.ema_window = int(ema_window)
         self._consolidation_mode = "online_on_step"
         self._capture = None
         self._step_updates = 0
@@ -286,6 +368,7 @@ class GradientAlignedMOnlineArm(_SignalRegArmBase):
             theta_retain=self.theta_retain,
             signal_type=_SIGNAL_TYPE,
             normalization=_NORMALIZATION,
+            ema_window=self.ema_window,
         )
         self._reg = None
         self._step_updates = 0
@@ -294,7 +377,10 @@ class GradientAlignedMOnlineArm(_SignalRegArmBase):
         if self._capture is not None:
             self._capture.remove()
             self._capture = None
-        self._capture = self._ActivityCapture(model, signal_type=_SIGNAL_TYPE, normalization=_NORMALIZATION)
+        self._capture = self._ActivityCapture(
+            model, signal_type=_SIGNAL_TYPE, normalization=_NORMALIZATION,
+            ema_window=self.ema_window,
+        )
         self._capture.register()
 
     def on_step(self, model, step: int, batch) -> None:
@@ -341,12 +427,16 @@ class GradientAlignedMOnlineArm(_SignalRegArmBase):
             "m_distribution_warnings": list(self._m_distribution_warnings),
             "signal_health": "ok",
             "importance_kind": "M",
+            "ema_window": self.ema_window,
+            "normalization": _NORMALIZATION,
+            "signal_tuning_source": self._signal_tuning_source,
         })
         return t
 
 
 def _accumulate_signal_into_M(
     model, dataloader, myelin, torch, n_steps=50, pad_token_id=None,
+    ema_window: int = 1, track_tau: float = None,
 ):
     """Run gradient-aligned signal capture over the task data into M.
 
@@ -355,14 +445,22 @@ def _accumulate_signal_into_M(
     MyelinState config (lock vs no-lock) differs between them.
 
     Pad positions are excluded from the CE used to form gradients.
+
+    If ``track_tau`` is set, returns a dict with mean fraction of
+    conditioned signal A above that break-even (for calib lag diagnostics).
+    Otherwise returns None.
     """
     from synthetic_myelination import ActivityCapture, unpack_lm_batch
 
-    capture = ActivityCapture(model, signal_type=_SIGNAL_TYPE, normalization=_NORMALIZATION)
+    capture = ActivityCapture(
+        model, signal_type=_SIGNAL_TYPE, normalization=_NORMALIZATION,
+        ema_window=int(ema_window),
+    )
     capture.register()
     was_training = model.training
     model.train()
     device = next(model.parameters()).device
+    a_exceed = []
     try:
         for step, batch in enumerate(dataloader):
             if step >= n_steps:
@@ -381,6 +479,13 @@ def _accumulate_signal_into_M(
                 out = model(input_ids, labels=labels)
             out.loss.backward()
             signals = capture.get_signals(normalize=True)
+            if track_tau is not None and signals:
+                fracs = []
+                for v in signals.values():
+                    if torch.is_tensor(v) and v.numel() > 0:
+                        fracs.append(float((v > track_tau).float().mean().item()))
+                if fracs:
+                    a_exceed.append(sum(fracs) / len(fracs))
             myelin.update(signals)
             capture.reset()
     finally:
@@ -388,6 +493,14 @@ def _accumulate_signal_into_M(
         model.zero_grad(set_to_none=True)
         if not was_training:
             model.eval()
+    if track_tau is None:
+        return None
+    return {
+        "frac_A_above_tau_mean": (
+            sum(a_exceed) / len(a_exceed) if a_exceed else None
+        ),
+        "frac_A_above_tau_n_steps": len(a_exceed),
+    }
 
 
 ARM_REGISTRY = {

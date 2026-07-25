@@ -39,7 +39,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 # Local layout:  benchmarks/trace/            -> two levels up to Synthetic2/, sm_src sibling there.
 # Remote layout: /workspace/synth/trace/      -> one level up to /workspace/synth/, sm_src sibling there
@@ -569,6 +569,12 @@ def _construct_arm(ArmCls, lam: float, seed: int, pad_token_id=None,
         kw["alpha"] = tuning.get(
             "model_averaging_alpha", DEFAULT_MODEL_AVERAGING_ALPHA
         )
+    # Mechanism arms: explicit signal_tuning dict suppresses auto filesystem load.
+    if name in ("gradient_aligned_m", "raw_fisher_signal",
+                "gradient_aligned_m_online"):
+        if "signal_tuning" in tuning:
+            kw["signal_tuning"] = tuning["signal_tuning"]
+            kw["load_signal_tuning"] = False
     try:
         return ArmCls(**kw)
     except TypeError:
@@ -788,6 +794,536 @@ def tune_baselines(
     return chosen
 
 
+
+def _bt_beta_for_breakeven(alpha: float, tau: float) -> float:
+    """M-update break-even: tau = beta/(alpha+beta) => beta = alpha*tau/(1-tau)."""
+    tau = min(max(tau, 1e-6), 1.0 - 1e-6)
+    return alpha * tau / (1.0 - tau)
+
+
+def _bt_m_stats(myelin, bimodality_coefficient) -> Dict:
+    """Distribution-level M stats over non-head params."""
+    vals = []
+    for name, M in myelin.M.items():
+        if myelin._param_role.get(name, "representation") == "head":
+            continue
+        vals.extend(M.flatten().detach().cpu().float().tolist())
+    if not vals:
+        return dict(n=0, mean_M=None, frac_near_zero=None, frac_locked_hi=None,
+                    frac_mid=None, bc=None)
+    n = len(vals)
+    return dict(
+        n=n,
+        mean_M=sum(vals) / n,
+        frac_near_zero=sum(1 for m in vals if m < 0.01) / n,
+        frac_locked_hi=sum(1 for m in vals if m > 0.90) / n,
+        frac_mid=sum(1 for m in vals if 0.01 <= m <= 0.90) / n,
+        bc=bimodality_coefficient(vals),
+    )
+
+
+def _bt_hard_degenerate(myelin) -> Optional[str]:
+    """Hard-fail only empty / all-zero / NaN / Inf (not BC)."""
+    from synthetic_myelination import check_m_hard_degenerate
+    return check_m_hard_degenerate(myelin)
+
+
+def _bt_mass_split_health(stats: Dict) -> Dict:
+    """Health from mass split (DN02): need meaningful protected AND plastic mass."""
+    hi = stats.get("frac_locked_hi")
+    mid = stats.get("frac_mid")
+    z = stats.get("frac_near_zero")
+    if hi is None or mid is None or z is None:
+        return {"mass_split_ok": False, "mass_split_note": "missing stats"}
+    # Degenerate extremes: ~90% empty or ~90% ceiling.
+    if z >= 0.90:
+        return {"mass_split_ok": False, "mass_split_note": "near_zero_heavy"}
+    if hi >= 0.90:
+        return {"mass_split_ok": False, "mass_split_note": "locked_hi_heavy"}
+    # Prefer some mid or balanced hi/zero.
+    ok = (hi >= 0.05 and z <= 0.85) or (mid >= 0.10)
+    return {
+        "mass_split_ok": bool(ok),
+        "mass_split_note": "ok" if ok else "unbalanced_split",
+    }
+
+
+DEFAULT_CALIB_TAUS = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70]
+DEFAULT_CALIB_EMA_WINDOWS = [1, 5, 15, 40, 80]
+# Pre-registered protected-fraction frontier endpoints (DN02).
+PROTECTED_FRAC_TARGETS = [0.05, 0.10, 0.20, 0.40]
+# Over-smoothing guard: w=40 and w=80 are measured/mapped for curiosity and
+# boundary behavior, but never selectable as default-arm or EMA-on winners.
+# w<=15 remains adoptable (includes EMA-off w=1 and moderate EMA-on).
+MAX_ADOPTABLE_EMA_WINDOW = 15
+# Under-populated std guard: single-task rows report std=None (unknown), not
+# 0.0. Rows need at least this many tasks with a real protected fraction
+# before they may win selection / EMA-on verdict (same "measured≠selectable"
+# pattern as MAX_ADOPTABLE_EMA_WINDOW).
+MIN_TASKS_FOR_VERDICT = 2
+# Std must improve by at least this absolute amount, at comparable protected
+# mass, before EMA-on may win on std alone (guards tiny noise wins).
+EMA_ON_MATERIAL_STD_DELTA = 0.02
+# Protected-fraction means must agree within this absolute band for a
+# std-only EMA-on win to count as "comparable protected level".
+EMA_ON_COMPARABLE_PROT_BAND = 0.10
+
+
+def _ema_window_adoptable(w: int) -> bool:
+    return int(w) <= int(MAX_ADOPTABLE_EMA_WINDOW)
+
+
+def _row_selectable_for_verdict(t: dict) -> bool:
+    """True iff a lookup row may win recommended / EMA-on (not just be mapped)."""
+    if t.get("protected_frac_mean") is None:
+        return False
+    if t.get("n_hard_degenerate_tasks", 0) > 0:
+        return False
+    if not t.get("adoptable", _ema_window_adoptable(t.get("ema_window", 999))):
+        return False
+    if int(t.get("n_tasks") or 0) < int(MIN_TASKS_FOR_VERDICT):
+        return False
+    # Honest std required: None means under-populated, not "zero variance".
+    if t.get("protected_frac_std") is None:
+        return False
+    return True
+
+
+def _calib_steps_for_window(base_steps: int, ema_window: int) -> int:
+    """Warm EMA: steps = max(base, 10*w) so high-w rows are not under-warmed."""
+    return max(int(base_steps), 10 * int(ema_window))
+
+
+def _resolve_calib_task_ids(
+    calib_tasks: Optional[List[int]],
+    n_all: int,
+) -> Dict:
+    """Resolve --calib-tasks against TRACE length; fail-fast on empty/partial drop.
+
+    Returns a dict with:
+      full_run (bool): True iff caller requested all tasks (calib_tasks is None)
+      requested_tasks, task_ids, dropped_tasks, shard_label
+
+    Empty after filter OR any out-of-range index raises ValueError so a GPU
+    pod never burns on an empty/incomplete grid with a colliding shard name.
+    """
+    if n_all <= 0:
+        raise ValueError(
+            f"--calibrate: TRACE sequence is empty (n_all={n_all}); "
+            "cannot resolve task shards."
+        )
+    if calib_tasks is None:
+        task_ids = list(range(n_all))
+        return {
+            "full_run": True,
+            "requested_tasks": list(task_ids),
+            "task_ids": task_ids,
+            "dropped_tasks": [],
+            "shard_label": "all",
+        }
+
+    requested = [int(t) for t in calib_tasks]
+    if not requested:
+        raise ValueError(
+            "--calibrate: --calib-tasks was provided but empty. "
+            "Omit the flag for a full all-task run, or pass valid indices."
+        )
+    dropped = [t for t in requested if not (0 <= t < n_all)]
+    task_ids = [t for t in requested if 0 <= t < n_all]
+    # Preserve order, de-dupe while keeping first occurrence.
+    seen = set()
+    deduped = []
+    for t in task_ids:
+        if t not in seen:
+            seen.add(t)
+            deduped.append(t)
+    task_ids = deduped
+
+    if dropped:
+        raise ValueError(
+            "--calibrate: --calib-tasks contains out-of-range indices "
+            f"{dropped} (valid: 0..{n_all - 1}). Partial drops are fatal so "
+            "a pod cannot silently run a smaller shard than requested "
+            "(merge would under-count tasks). Fix the arm-spec / flag."
+        )
+    if not task_ids:
+        raise ValueError(
+            "--calibrate: --calib-tasks filtered to nothing "
+            f"(requested={requested}, n_trace_tasks={n_all}). "
+            "Refusing empty grid — would write a colliding/empty shard."
+        )
+    return {
+        "full_run": False,
+        "requested_tasks": requested,
+        "task_ids": task_ids,
+        "dropped_tasks": [],
+        "shard_label": "".join(str(t) for t in task_ids),
+    }
+
+
+def _build_lookup_and_recommend(points, taus, ema_windows, alpha):
+    """Aggregate points -> 2D lookup + nearest-50% default + full tau map.
+
+    Full table/map retain every measured w (including non-adoptable 40/80)
+    and under-populated single-task rows. Selection only considers rows that
+    pass ``_row_selectable_for_verdict`` (adoptable w, n_tasks>=min, real std).
+    """
+    import statistics
+
+    table = []
+    for w in ema_windows:
+        for tau in taus:
+            rows = [
+                p for p in points
+                if abs(p["tau"] - round(float(tau), 4)) < 1e-9
+                and int(p["ema_window"]) == int(w)
+            ]
+            hi = [p["frac_locked_hi"] for p in rows if p.get("frac_locked_hi") is not None]
+            mid = [p["frac_mid"] for p in rows if p.get("frac_mid") is not None]
+            z = [p["frac_near_zero"] for p in rows if p.get("frac_near_zero") is not None]
+            a_ex = [
+                p["frac_A_above_tau_mean"] for p in rows
+                if p.get("frac_A_above_tau_mean") is not None
+            ]
+            hard_deg = sum(1 for p in rows if p.get("hard_degenerate"))
+            mass_bad = sum(1 for p in rows if not p.get("mass_split_ok", True))
+            bc_warn = sum(1 for p in rows if p.get("bc_warning"))
+            # steps: surface heterogeneity across merged shards instead of
+            # silently taking rows[0].
+            step_vals = sorted({
+                int(p["steps"]) for p in rows
+                if p.get("steps") is not None
+            })
+            steps_heterogeneous = len(step_vals) > 1
+            entry = dict(
+                tau=round(float(tau), 4),
+                ema_window=int(w),
+                adoptable=_ema_window_adoptable(w),
+                beta=round(_bt_beta_for_breakeven(alpha, float(tau)), 6),
+                steps_used=(step_vals[0] if len(step_vals) == 1 else None),
+                steps_used_values=step_vals,
+                steps_heterogeneous=steps_heterogeneous,
+                protected_frac_mean=statistics.mean(hi) if hi else None,
+                # None = unknown (n<2), never fake 0.0 precision.
+                protected_frac_std=(
+                    statistics.pstdev(hi) if len(hi) > 1 else None
+                ),
+                plastic_mid_frac_mean=statistics.mean(mid) if mid else None,
+                near_zero_frac_mean=statistics.mean(z) if z else None,
+                frac_A_above_tau_mean=statistics.mean(a_ex) if a_ex else None,
+                n_hard_degenerate_tasks=hard_deg,
+                n_mass_split_fail_tasks=mass_bad,
+                n_bc_warning_tasks=bc_warn,
+                n_tasks=len(rows),
+                n_tasks_with_protected=len(hi),
+            )
+            entry["selectable_for_verdict"] = _row_selectable_for_verdict(entry)
+            table.append(entry)
+
+    def _score(t):
+        if not _row_selectable_for_verdict(t):
+            return (1e9,)
+        # Prefer mass-split healthy rows; std is guaranteed real here.
+        return (
+            t["n_mass_split_fail_tasks"],
+            abs(t["protected_frac_mean"] - 0.5)
+            + 2.0 * float(t["protected_frac_std"]),
+        )
+
+    healthy = [t for t in table if _row_selectable_for_verdict(t)]
+    recommended = min(healthy, key=_score) if healthy else None
+
+    # Full tau -> protected-fraction map per ema_window (for frontier sweep).
+    protected_frac_map = {}
+    for w in ema_windows:
+        series = []
+        for tau in taus:
+            rows = [
+                t for t in table
+                if int(t["ema_window"]) == int(w)
+                and abs(t["tau"] - round(float(tau), 4)) < 1e-9
+            ]
+            if not rows:
+                continue
+            t0 = rows[0]
+            series.append({
+                "tau": t0["tau"],
+                "beta": t0["beta"],
+                "protected_frac_mean": t0["protected_frac_mean"],
+                "protected_frac_std": t0["protected_frac_std"],
+            })
+        protected_frac_map[str(int(w))] = series
+
+    # Nearest grid tau for each pre-registered protected-fraction target.
+    frontier_endpoints = []
+    if recommended is not None:
+        w_star = int(recommended["ema_window"])
+        series = protected_frac_map.get(str(w_star), [])
+        for target in PROTECTED_FRAC_TARGETS:
+            cand = [
+                s for s in series
+                if s["protected_frac_mean"] is not None
+            ]
+            if not cand:
+                continue
+            best = min(
+                cand,
+                key=lambda s: abs(s["protected_frac_mean"] - target),
+            )
+            frontier_endpoints.append({
+                "target_protected_frac": target,
+                "tau": best["tau"],
+                "beta": best["beta"],
+                "ema_window": w_star,
+                "achieved_protected_frac_mean": best["protected_frac_mean"],
+            })
+
+    return table, recommended, protected_frac_map, frontier_endpoints
+
+
+def _calib_summary(rec: Dict) -> str:
+    """Dispatcher-visible results_summary.txt for calib shards."""
+    A = rec["alpha"]
+    lines = [
+        "=== signal calibration (init-signal, rank)  alpha=%s ===" % A,
+        "scope=%s  shard=%s  ema_windows=%s  taus=%s" % (
+            rec.get("calibration_scope"),
+            rec.get("task_shard"),
+            rec.get("ema_windows"),
+            rec.get("taus"),
+        ),
+        "tau".rjust(5) + "w".rjust(5) + "prot%".rjust(8) + "+/-".rjust(7)
+        + "mid%".rjust(7) + "~0%".rjust(7) + "A>t%".rjust(7)
+        + "hard".rjust(6) + "mass".rjust(6),
+    ]
+    for t in rec["lookup_table"]:
+        pm = t["protected_frac_mean"]
+        if pm is None:
+            lines.append("%5.2f%5d  (no data)" % (t["tau"], t["ema_window"]))
+            continue
+        std = t.get("protected_frac_std")
+        std_s = ("  n/a" if std is None else "%7.1f" % (100 * std))
+        sel = "sel" if t.get("selectable_for_verdict") else "map"
+        het = " steps!" if t.get("steps_heterogeneous") else ""
+        lines.append(
+            "%5.2f%5d%7.1f%s%7.1f%7.1f%7.1f%4d/%d%4d/%d %s%s" % (
+                t["tau"], t["ema_window"],
+                100 * pm, std_s,
+                100 * (t["plastic_mid_frac_mean"] or 0),
+                100 * (t["near_zero_frac_mean"] or 0),
+                100 * (t["frac_A_above_tau_mean"] or 0),
+                t["n_hard_degenerate_tasks"], t["n_tasks"],
+                t["n_mass_split_fail_tasks"], t["n_tasks"],
+                sel, het,
+            )
+        )
+    rc = rec.get("recommended")
+    if rc:
+        std = rc.get("protected_frac_std")
+        std_s = "n/a" if std is None else ("%.1f" % (100 * std))
+        lines.append(
+            "RECOMMENDED_DEFAULT_ARM tau=%.2f w=%d -> protected %.1f%% +/-%s, "
+            "beta=%.4f (nearest-50%%; not the full frontier)" % (
+                rc["tau"], rc["ema_window"],
+                100 * rc["protected_frac_mean"],
+                std_s,
+                _bt_beta_for_breakeven(A, rc["tau"]),
+            )
+        )
+    else:
+        lines.append(
+            "RECOMMENDED_DEFAULT_ARM: NONE selectable "
+            "(need adoptable w, n_tasks>=%d, real std)."
+            % MIN_TASKS_FOR_VERDICT
+        )
+    lines.append(
+        "NOTE: init-signal calibration only. Do not lock tau*/w* into arms "
+        "until a post-1-epoch-task0 confirmation cell agrees."
+    )
+    return "\n".join(lines)
+
+
+def calibrate_signal(
+    *,
+    taus: List[float] = None,
+    ema_windows: List[int] = None,
+    alpha: float = 0.1,
+    steps: int = 150,
+    calib_tasks: List[int] = None,
+    model_id: str = None,
+    data_root=None,
+    batch_size: int = 8,
+    max_len: int = 512,
+) -> Dict:
+    """Init-signal calibration on real Llama+LoRA TRACE gradients (DN02).
+
+    Sweeps the 2-D grid (tau x ema_window). Per point steps = max(base, 10*w)
+    so EMA windows are warmed. No CL sequence / no BWT. Scope is explicitly
+    init-weights; arm defaults require a post-task confirmation cell.
+    """
+    import torch
+
+    from trace_data import build_real_model
+    from arms_mechanism import _accumulate_signal_into_M
+    from synthetic_myelination import MyelinState, bimodality_coefficient
+    from fetch_data import TRACE_TASKS
+
+    _SIGNAL_TYPE = "grad_l2_per_neuron"
+    taus = list(taus or DEFAULT_CALIB_TAUS)
+    ema_windows = [int(w) for w in (ema_windows or DEFAULT_CALIB_EMA_WINDOWS)]
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, tokenizer = build_real_model(model_id, device)
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    sequence = build_task_sequence(
+        "trace", tokenizer=tokenizer, data_root=data_root,
+        batch_size=batch_size, max_len=max_len,
+    )
+    n_all = len(sequence)
+    # Fail-fast before model work is wasted: empty or partially invalid
+    # --calib-tasks must not produce a silent undersized / colliding shard.
+    shard_meta = _resolve_calib_task_ids(calib_tasks, n_all)
+    task_ids = shard_meta["task_ids"]
+
+    print(
+        f"[calib] INIT-SIGNAL scope device={device} taus={taus} "
+        f"ema_windows={ema_windows} tasks={task_ids} "
+        f"shard_label={shard_meta['shard_label']!r} "
+        f"base_steps={steps} alpha={alpha} (of {n_all} TRACE tasks)",
+        flush=True,
+    )
+
+    points = []
+    for w in ema_windows:
+        n_steps = _calib_steps_for_window(steps, w)
+        for tau in taus:
+            beta = _bt_beta_for_breakeven(alpha, tau)
+            for ti in task_ids:
+                for p in model.parameters():
+                    p.grad = None
+                model.train()
+                myelin = MyelinState(
+                    model, alpha=alpha, beta=beta,
+                    use_asymptotic_lock=True, signal_type=_SIGNAL_TYPE,
+                    normalization="rank",
+                    ema_window=int(w),
+                )
+                a_diag = _accumulate_signal_into_M(
+                    model, sequence[ti][0], myelin, torch,
+                    n_steps=n_steps, pad_token_id=pad_token_id,
+                    ema_window=int(w), track_tau=float(tau),
+                ) or {}
+                stats = _bt_m_stats(myelin, bimodality_coefficient)
+                hard = _bt_hard_degenerate(myelin)
+                mass = _bt_mass_split_health(stats)
+                # BC is warning-only (DN02 / M2).
+                bc_warn = None
+                try:
+                    from synthetic_myelination import check_degenerate_M
+                    bc_warn = check_degenerate_M(myelin)
+                except Exception:
+                    bc_warn = None
+                r = dict(
+                    tau=round(float(tau), 4),
+                    ema_window=int(w),
+                    alpha=alpha,
+                    beta=round(beta, 6),
+                    task_idx=ti,
+                    task=(
+                        TRACE_TASKS[ti] if ti < len(TRACE_TASKS) else str(ti)
+                    ),
+                    steps=n_steps,
+                    hard_degenerate=hard,
+                    bc_warning=bc_warn,
+                    mass_split_ok=mass["mass_split_ok"],
+                    mass_split_note=mass["mass_split_note"],
+                    frac_A_above_tau_mean=a_diag.get("frac_A_above_tau_mean"),
+                    frac_A_above_tau_n_steps=a_diag.get(
+                        "frac_A_above_tau_n_steps"
+                    ),
+                    **stats,
+                )
+                points.append(r)
+                print(
+                    f"[calib] tau={tau:.2f} w={w} task={ti} steps={n_steps} "
+                    f"meanM={r['mean_M']} %~0={None if r['frac_near_zero'] is None else 100*r['frac_near_zero']:.1f} "
+                    f"%hi={None if r['frac_locked_hi'] is None else 100*r['frac_locked_hi']:.1f} "
+                    f"A>t={None if r['frac_A_above_tau_mean'] is None else 100*r['frac_A_above_tau_mean']:.1f} "
+                    f"hard={'Y' if hard else 'n'} mass={'ok' if mass['mass_split_ok'] else mass['mass_split_note']}",
+                    flush=True,
+                )
+
+    table, recommended, pmap, frontier = _build_lookup_and_recommend(
+        points, taus, ema_windows, alpha,
+    )
+
+    return dict(
+        harness="calibrate_signal",
+        design_note="02_signal_normalization_pivot",
+        calibration_scope="init_signal",
+        calibration_scope_note=(
+            "Measured on fresh LoRA-init weights with TRACE task batches. "
+            "NOT post-task M. Do not lock tau*/w* into mechanism arms until a "
+            "cheap post-1-epoch-task0 confirmation cell agrees on mass split."
+        ),
+        normalization="rank",
+        signal_type=_SIGNAL_TYPE,
+        alpha=alpha,
+        base_steps=steps,
+        taus=taus,
+        ema_windows=ema_windows,
+        task_shard=task_ids,
+        task_shard_full_run=bool(shard_meta["full_run"]),
+        task_shard_label=shard_meta["shard_label"],
+        requested_tasks=list(shard_meta["requested_tasks"]),
+        dropped_tasks=list(shard_meta["dropped_tasks"]),
+        n_trace_tasks=n_all,
+        points=points,
+        lookup_table=table,
+        protected_frac_map=pmap,
+        frontier_endpoints=frontier,
+        recommended=recommended,
+        protected_frac_targets=PROTECTED_FRAC_TARGETS,
+        note=(
+            "Init-signal calibration: break-even x ema_window -> protected "
+            "fraction on real TRACE gradients under rank conditioning. "
+            "NOT a CL evaluation; no BWT claim. recommended = nearest-50% "
+            "default-arm pick; protected_frac_map + frontier_endpoints feed "
+            "the pre-registered {5,10,20,40}% axis. Merge shards with "
+            "infra/merge_calib_shards.py before writing signal_tuning.json. "
+            "Shard label is explicit ('all' only for intentional full runs)."
+        ),
+    )
+
+
+def write_signal_tuning_json(recommended: Dict, alpha: float, path: Path) -> Path:
+    """Write signal_tuning.json for mechanism-arm autowire (M3)."""
+    if not recommended:
+        raise ValueError("no recommended row to write")
+    tau = float(recommended["tau"])
+    payload = {
+        "schema": "signal_tuning/v1",
+        "design_note": "02_signal_normalization_pivot",
+        "calibration_scope": "init_signal",
+        "alpha": float(alpha),
+        "beta": float(_bt_beta_for_breakeven(alpha, tau)),
+        "tau": tau,
+        "ema_window": int(recommended["ema_window"]),
+        "normalization": "rank",
+        "protected_frac_mean": recommended.get("protected_frac_mean"),
+        "protected_frac_std": recommended.get("protected_frac_std"),
+        "confirmation_required": True,
+        "confirmation_note": (
+            "Init-signal only. Run a post-1-epoch-task0 confirmation cell "
+            "before treating these as locked arm defaults."
+        ),
+    }
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n")
+    return path
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -800,8 +1336,29 @@ def main():
     ap.add_argument("--tune-baselines", action="store_true",
                     help="1-seed/2-task pre-study for elastic_reset.rho and "
                          "model_averaging.alpha; write chosen values and exit")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="Design Note 02 init-signal calibration: tau x "
+                         "ema_window grid on real TRACE gradients under rank. "
+                         "Not a CL eval; emits no BWT.")
+    ap.add_argument("--calib-tasks", type=int, nargs="+", default=None,
+                    help="TRACE task indices for this shard (parallel fan-out). "
+                         "Omit for intentional full all-task run (shard label "
+                         "'all'). Out-of-range or empty specs are fatal "
+                         "(no silent partial drop / empty grid).")
+    ap.add_argument("--taus", type=float, nargs="+", default=None,
+                    help="break-even thresholds (default 0.1..0.7).")
+    ap.add_argument("--ema-windows", type=int, nargs="+", default=None,
+                    help="EMA windows to sweep (default 1 5 15 40 80).")
+    ap.add_argument("--calib-alpha", type=float, default=0.1,
+                    help="alpha held fixed while beta sets the break-even.")
+    ap.add_argument("--calib-steps", type=int, default=150,
+                    help="base signal-accumulation steps; actual steps per "
+                         "point = max(this, 10*ema_window).")
     ap.add_argument("--baseline-tuning-json", type=Path, default=None,
                     help="load previously chosen rho/alpha from --tune-baselines")
+    ap.add_argument("--signal-tuning-json", type=Path, default=None,
+                    help="load signal_tuning.json (alpha/beta/ema_window) into "
+                         "mechanism arms; also written by merge_calib_shards")
     ap.add_argument("--arms", nargs="+", default=EXP1_ARMS)
     ap.add_argument("--seeds", type=int, nargs="+", default=None)
     ap.add_argument("--lambdas", type=float, nargs="+", default=None)
@@ -858,6 +1415,54 @@ def main():
         print(f"[tune] written: {tune_path}")
         return
 
+    if args.calibrate:
+        # Design Note 02 init-signal calibration (tau x ema_window).
+        # Task-sharded via --calib-tasks; no seed guard. Artifacts land in
+        # results/ for B2/SCP. Merge shards before writing signal_tuning.json.
+        try:
+            rec = calibrate_signal(
+                taus=args.taus,
+                ema_windows=args.ema_windows,
+                alpha=args.calib_alpha,
+                steps=args.calib_steps,
+                calib_tasks=args.calib_tasks,
+                model_id=args.model_id,
+                data_root=args.data_root,
+                batch_size=args.batch_size,
+                max_len=args.max_len,
+            )
+        except ValueError as exc:
+            # Fail-fast shard resolution (empty / partial --calib-tasks).
+            print(f"[calib] FATAL: {exc}", file=sys.stderr, flush=True)
+            sys.exit(2)
+        # Explicit label from resolver: "all" only for intentional full runs;
+        # never `or "all"` fallback (collides empty-shard with full-run).
+        shard = rec.get("task_shard_label")
+        if not shard:
+            shard = (
+                "all" if rec.get("task_shard_full_run")
+                else "".join(str(t) for t in (rec.get("task_shard") or []))
+            )
+        if not shard:
+            print(
+                "[calib] FATAL: empty task_shard_label after successful "
+                "calibrate_signal (internal invariant broken).",
+                file=sys.stderr, flush=True,
+            )
+            sys.exit(2)
+        calib_path = out.parent / f"calib_signal_shard{shard}.json"
+        calib_path.write_text(json.dumps(rec, indent=2))
+        summary = _calib_summary(rec)
+        (out.parent / "results_summary.txt").write_text(summary + "\n")
+        print("\n" + summary, flush=True)
+        print(f"[calib] written: {calib_path}", flush=True)
+        print(
+            "[calib] scope=init_signal — confirm post-1-epoch-task0 before "
+            "locking arm defaults; merge shards with infra/merge_calib_shards.py",
+            flush=True,
+        )
+        return
+
     if not args.smoke and len(seeds) < 5:
         print("[run] REFUSING: run of record requires n>=5 seeds (README). "
               "Use --smoke for preflight.", file=sys.stderr)
@@ -871,9 +1476,21 @@ def main():
                 tuning[k] = float(loaded[k])
         print(f"[run] loaded baseline tuning: {tuning}", flush=True)
 
+    signal_tuning = None
+    if args.signal_tuning_json is not None:
+        from arms_mechanism import load_signal_tuning
+        signal_tuning = load_signal_tuning(args.signal_tuning_json)
+        if signal_tuning:
+            print(f"[run] loaded signal tuning: {signal_tuning}", flush=True)
+        else:
+            print(f"[run] WARN: --signal-tuning-json not found/empty: "
+                  f"{args.signal_tuning_json}", flush=True)
+
     # Cell checkpoints MUST sit next to the final JSON so B2/SCP capture them.
     ckpt_dir = out.parent / "cells"
 
+    if signal_tuning:
+        tuning["signal_tuning"] = signal_tuning
     results = run(mode, args.arms, seeds, lambdas, n_tasks, args.lr, args.epochs,
                   model_id=args.model_id, data_root=args.data_root,
                   batch_size=args.batch_size, max_len=args.max_len,

@@ -89,15 +89,35 @@ distribution-invariant.
 1. The protected fraction becomes a **pre-registered, swept axis** (target
    fraction ∈ {5, 10, 20, 40}% via the break-even / percentile), reported as a
    frontier. We do **not** pick the single best fraction and report it as the
-   result.
+   result. Calibration emits the full \(\tau \mapsto\) protected-fraction map
+   so the matrix can place those endpoints; the nearest-50% pick is only the
+   *default arm* recommendation.
 2. Health check per cell is no longer "BC alone" (M is always bimodal). The
    binding health signal is the **mass split**: a healthy cell has a
    meaningful fraction of M both protected *and* plastic — neither ~90% at
-   zero nor ~90% at ceiling. This threshold is added to the degenerate-M
-   telemetry interpretation (hard-abort still only on empty/NaN/Inf).
-3. Re-validate on real TRACE gradients before the fleet: one short real-model
-   probe to confirm the protected fraction is stable across TRACE's
-   heterogeneous tasks under smoothed-rank, then one confirmation cell.
+   zero nor ~90% at ceiling. Hard-abort remains empty/NaN/Inf only; BC is a
+   warning. Calib scores `n_hard_degenerate` and mass-split separately.
+3. Re-validate on real TRACE gradients before the fleet (**init-signal
+   calibration**), then a cheap **post-1-epoch-task0 confirmation cell**
+   before locking \(\tau^\*/w^\*\) into arms. Init-signal \(\tau^\*/w^\*\) are
+   **not** arm defaults until confirmation agrees on mass split.
+4. **EMA window \(w\) is a swept axis** alongside \(\tau\): default grid
+   \(w \in \{1, 5, 15, 40, 80\}\). Per-point steps = \(\max(150, 10\cdot w)\)
+   so high-\(w\) rows are warmed. **Adoptable range:** only \(w \le
+   \texttt{MAX\_ADOPTABLE\_EMA\_WINDOW}\) (= 15) may be selected as default-arm
+   or EMA-on winner. \(w \in \{40, 80\}\) stay in the measured map (curiosity /
+   over-smoothing boundary) but cannot win — high-\(w\) shrinks cross-task std
+   by washing signal, which is not a scientific improvement.
+   **Verdict rule for EMA-on:** within the adoptable range, adopt \(w>1\) only
+   if it **improves mass split**, or achieves a **material** std reduction
+   (\(\ge 0.02\)) at a **comparable** protected fraction (within 0.10); std-alone
+   / over-smoothed wins do not count. Otherwise record **"rank alone suffices
+   on TRACE"**. **Under-populated std:** with \(n_{\mathrm{tasks}} <
+   \texttt{MIN\_TASKS\_FOR\_VERDICT}\) (= 2), `protected_frac_std` is `None`
+   (unknown), never fake `0.0`; such rows are mapped but not selectable. The
+   std term of the adopt rule requires **both** sides to have a real std;
+   otherwise decide on mass-split alone. \(\alpha\), `lock_consec_steps`,
+   `theta_retain`, `update_interval` stay fixed.
 
 ## Status of prior conclusions
 
@@ -107,3 +127,29 @@ distribution-invariant.
   **void as evidence** — it was a single-arm timing cell with a degenerate
   signal, and answered no hypothesis. It is retained only as the trigger for
   this pivot.
+
+## How calibration is run (operational)
+
+Point 3 is a **first-class mode of `run.py`** (same launcher/dispatcher/B2
+path as the eval fleet). `benchmarks/trace/calibrate_signal.py` is a thin
+wrapper only — no second model-loading path.
+
+- **Scope label:** `calibration_scope: "init_signal"` — fresh LoRA-init
+  weights + TRACE batches. Not post-task M.
+- **Grid (locked):** \(\tau \in \{0.1\ldots0.7\}\), \(w \in \{1,5,15,40,80\}\);
+  one pod per TRACE task; each pod runs the full \(\tau \times w\) grid on
+  its shard. Steps per point = \(\max(\texttt{--calib-steps}, 10w)\).
+- **Outputs per shard:** `calib_signal_shard<i>.json` + `results_summary.txt`
+  (lookup, A>\(\tau\) exceedance, mass split, BC warning).
+- **Merge:** `infra/merge_calib_shards.py` / `make merge-calib` unions points,
+  rebuilds the 2-D lookup, applies the EMA verdict rule, writes optional
+  `signal_tuning.json` for mechanism-arm autowire (`--signal-tuning-json`).
+- **No BWT claim.** Seed-of-record guard does not apply.
+
+Commands:
+
+    make run-parallel-calib BENCH=trace GPU=A40 CLOUD=SECURE
+    make merge-calib
+    # after post-1-epoch-task0 confirmation:
+    make run-bg BENCH=trace GPU=A40 CLOUD=SECURE \
+      EXTRA_FLAGS='--extra-args --signal-tuning-json lab_reports/_staging/signal_tuning.json'
