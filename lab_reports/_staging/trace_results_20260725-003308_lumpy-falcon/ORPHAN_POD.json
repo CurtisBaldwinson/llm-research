@@ -1,0 +1,21 @@
+{
+  "instance_id": "2nb4gs49n479n1",
+  "label": "ssh root@194.68.245.220 -p 22024",
+  "provenance": {
+    "canonical_gpu": "A40",
+    "cloud_type": "SECURE",
+    "container_disk_gb": 50,
+    "cost_per_hr_usd": 0.44,
+    "created_utc": "2026-07-25T07:33:09Z",
+    "data_centers": null,
+    "gpu_count": 1,
+    "gpu_type": "NVIDIA A40",
+    "image": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
+    "pod_id": "2nb4gs49n479n1",
+    "provider": "runpod",
+    "volume_gb": 20
+  },
+  "provider": "runpod",
+  "reason": "kept_alive_remote_may_be_running",
+  "written_utc": "2026-07-25T09:46:58Z"
+}

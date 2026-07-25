@@ -1,0 +1,42 @@
+[
+  {
+    "slug": "task0",
+    "value": "task0",
+    "extra_args": "--calibrate --calib-tasks 0 --taus 0.1 0.2 0.3 0.4 0.5 0.6 0.7 --ema-windows 1 5 15 40 80 --calib-alpha 0.1 --calib-steps 150 --n_tasks 8"
+  },
+  {
+    "slug": "task1",
+    "value": "task1",
+    "extra_args": "--calibrate --calib-tasks 1 --taus 0.1 0.2 0.3 0.4 0.5 0.6 0.7 --ema-windows 1 5 15 40 80 --calib-alpha 0.1 --calib-steps 150 --n_tasks 8"
+  },
+  {
+    "slug": "task2",
+    "value": "task2",
+    "extra_args": "--calibrate --calib-tasks 2 --taus 0.1 0.2 0.3 0.4 0.5 0.6 0.7 --ema-windows 1 5 15 40 80 --calib-alpha 0.1 --calib-steps 150 --n_tasks 8"
+  },
+  {
+    "slug": "task3",
+    "value": "task3",
+    "extra_args": "--calibrate --calib-tasks 3 --taus 0.1 0.2 0.3 0.4 0.5 0.6 0.7 --ema-windows 1 5 15 40 80 --calib-alpha 0.1 --calib-steps 150 --n_tasks 8"
+  },
+  {
+    "slug": "task4",
+    "value": "task4",
+    "extra_args": "--calibrate --calib-tasks 4 --taus 0.1 0.2 0.3 0.4 0.5 0.6 0.7 --ema-windows 1 5 15 40 80 --calib-alpha 0.1 --calib-steps 150 --n_tasks 8"
+  },
+  {
+    "slug": "task5",
+    "value": "task5",
+    "extra_args": "--calibrate --calib-tasks 5 --taus 0.1 0.2 0.3 0.4 0.5 0.6 0.7 --ema-windows 1 5 15 40 80 --calib-alpha 0.1 --calib-steps 150 --n_tasks 8"
+  },
+  {
+    "slug": "task6",
+    "value": "task6",
+    "extra_args": "--calibrate --calib-tasks 6 --taus 0.1 0.2 0.3 0.4 0.5 0.6 0.7 --ema-windows 1 5 15 40 80 --calib-alpha 0.1 --calib-steps 150 --n_tasks 8"
+  },
+  {
+    "slug": "task7",
+    "value": "task7",
+    "extra_args": "--calibrate --calib-tasks 7 --taus 0.1 0.2 0.3 0.4 0.5 0.6 0.7 --ema-windows 1 5 15 40 80 --calib-alpha 0.1 --calib-steps 150 --n_tasks 8"
+  }
+]

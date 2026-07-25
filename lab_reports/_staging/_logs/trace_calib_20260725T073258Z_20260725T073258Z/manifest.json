@@ -1,0 +1,94 @@
+{
+  "name": "trace_calib_20260725T073258Z",
+  "stamp": "20260725T073258Z",
+  "benchmark": "trace",
+  "provider": "runpod",
+  "gpu_type": "A40",
+  "cloud": "SECURE",
+  "dispatch_mode": "arm-spec",
+  "extra_args_template": null,
+  "arm_spec_path": "lab_reports/_staging/_armspecs/trace_calib_20260725T073258Z.json",
+  "arm_count": 8,
+  "arms": [
+    {
+      "value": "task0",
+      "slug": "task0",
+      "pid": 15040,
+      "extra_args": "--calibrate --calib-tasks 0 --taus 0.1 0.2 0.3 0.4 0.5 0.6 0.7 --ema-windows 1 5 15 40 80 --calib-alpha 0.1 --calib-steps 150 --n_tasks 8",
+      "cmd": "/Users/chunter/code/curtis/Synthetic2/infra/.venv/bin/python /Users/chunter/code/curtis/Synthetic2/infra/run_on_cloud.py --provider runpod --benchmark trace --gpu-type A40 --cloud SECURE --extra-args '--calibrate --calib-tasks 0 --taus 0.1 0.2 0.3 0.4 0.5 0.6 0.7 --ema-windows 1 5 15 40 80 --calib-alpha 0.1 --calib-steps 150 --n_tasks 8'",
+      "log_path": "lab_reports/_staging/_logs/trace_calib_20260725T073258Z_20260725T073258Z/arm_task0.nohup.log",
+      "pid_path": "lab_reports/_staging/_logs/trace_calib_20260725T073258Z_20260725T073258Z/arm_task0.pid",
+      "launched_utc": "2026-07-25T07:32:58.218015+00:00"
+    },
+    {
+      "value": "task1",
+      "slug": "task1",
+      "pid": 15501,
+      "extra_args": "--calibrate --calib-tasks 1 --taus 0.1 0.2 0.3 0.4 0.5 0.6 0.7 --ema-windows 1 5 15 40 80 --calib-alpha 0.1 --calib-steps 150 --n_tasks 8",
+      "cmd": "/Users/chunter/code/curtis/Synthetic2/infra/.venv/bin/python /Users/chunter/code/curtis/Synthetic2/infra/run_on_cloud.py --provider runpod --benchmark trace --gpu-type A40 --cloud SECURE --extra-args '--calibrate --calib-tasks 1 --taus 0.1 0.2 0.3 0.4 0.5 0.6 0.7 --ema-windows 1 5 15 40 80 --calib-alpha 0.1 --calib-steps 150 --n_tasks 8'",
+      "log_path": "lab_reports/_staging/_logs/trace_calib_20260725T073258Z_20260725T073258Z/arm_task1.nohup.log",
+      "pid_path": "lab_reports/_staging/_logs/trace_calib_20260725T073258Z_20260725T073258Z/arm_task1.pid",
+      "launched_utc": "2026-07-25T07:33:00.226050+00:00"
+    },
+    {
+      "value": "task2",
+      "slug": "task2",
+      "pid": 15560,
+      "extra_args": "--calibrate --calib-tasks 2 --taus 0.1 0.2 0.3 0.4 0.5 0.6 0.7 --ema-windows 1 5 15 40 80 --calib-alpha 0.1 --calib-steps 150 --n_tasks 8",
+      "cmd": "/Users/chunter/code/curtis/Synthetic2/infra/.venv/bin/python /Users/chunter/code/curtis/Synthetic2/infra/run_on_cloud.py --provider runpod --benchmark trace --gpu-type A40 --cloud SECURE --extra-args '--calibrate --calib-tasks 2 --taus 0.1 0.2 0.3 0.4 0.5 0.6 0.7 --ema-windows 1 5 15 40 80 --calib-alpha 0.1 --calib-steps 150 --n_tasks 8'",
+      "log_path": "lab_reports/_staging/_logs/trace_calib_20260725T073258Z_20260725T073258Z/arm_task2.nohup.log",
+      "pid_path": "lab_reports/_staging/_logs/trace_calib_20260725T073258Z_20260725T073258Z/arm_task2.pid",
+      "launched_utc": "2026-07-25T07:33:02.240269+00:00"
+    },
+    {
+      "value": "task3",
+      "slug": "task3",
+      "pid": 16219,
+      "extra_args": "--calibrate --calib-tasks 3 --taus 0.1 0.2 0.3 0.4 0.5 0.6 0.7 --ema-windows 1 5 15 40 80 --calib-alpha 0.1 --calib-steps 150 --n_tasks 8",
+      "cmd": "/Users/chunter/code/curtis/Synthetic2/infra/.venv/bin/python /Users/chunter/code/curtis/Synthetic2/infra/run_on_cloud.py --provider runpod --benchmark trace --gpu-type A40 --cloud SECURE --extra-args '--calibrate --calib-tasks 3 --taus 0.1 0.2 0.3 0.4 0.5 0.6 0.7 --ema-windows 1 5 15 40 80 --calib-alpha 0.1 --calib-steps 150 --n_tasks 8'",
+      "log_path": "lab_reports/_staging/_logs/trace_calib_20260725T073258Z_20260725T073258Z/arm_task3.nohup.log",
+      "pid_path": "lab_reports/_staging/_logs/trace_calib_20260725T073258Z_20260725T073258Z/arm_task3.pid",
+      "launched_utc": "2026-07-25T07:33:04.250380+00:00"
+    },
+    {
+      "value": "task4",
+      "slug": "task4",
+      "pid": 16461,
+      "extra_args": "--calibrate --calib-tasks 4 --taus 0.1 0.2 0.3 0.4 0.5 0.6 0.7 --ema-windows 1 5 15 40 80 --calib-alpha 0.1 --calib-steps 150 --n_tasks 8",
+      "cmd": "/Users/chunter/code/curtis/Synthetic2/infra/.venv/bin/python /Users/chunter/code/curtis/Synthetic2/infra/run_on_cloud.py --provider runpod --benchmark trace --gpu-type A40 --cloud SECURE --extra-args '--calibrate --calib-tasks 4 --taus 0.1 0.2 0.3 0.4 0.5 0.6 0.7 --ema-windows 1 5 15 40 80 --calib-alpha 0.1 --calib-steps 150 --n_tasks 8'",
+      "log_path": "lab_reports/_staging/_logs/trace_calib_20260725T073258Z_20260725T073258Z/arm_task4.nohup.log",
+      "pid_path": "lab_reports/_staging/_logs/trace_calib_20260725T073258Z_20260725T073258Z/arm_task4.pid",
+      "launched_utc": "2026-07-25T07:33:06.264711+00:00"
+    },
+    {
+      "value": "task5",
+      "slug": "task5",
+      "pid": 16551,
+      "extra_args": "--calibrate --calib-tasks 5 --taus 0.1 0.2 0.3 0.4 0.5 0.6 0.7 --ema-windows 1 5 15 40 80 --calib-alpha 0.1 --calib-steps 150 --n_tasks 8",
+      "cmd": "/Users/chunter/code/curtis/Synthetic2/infra/.venv/bin/python /Users/chunter/code/curtis/Synthetic2/infra/run_on_cloud.py --provider runpod --benchmark trace --gpu-type A40 --cloud SECURE --extra-args '--calibrate --calib-tasks 5 --taus 0.1 0.2 0.3 0.4 0.5 0.6 0.7 --ema-windows 1 5 15 40 80 --calib-alpha 0.1 --calib-steps 150 --n_tasks 8'",
+      "log_path": "lab_reports/_staging/_logs/trace_calib_20260725T073258Z_20260725T073258Z/arm_task5.nohup.log",
+      "pid_path": "lab_reports/_staging/_logs/trace_calib_20260725T073258Z_20260725T073258Z/arm_task5.pid",
+      "launched_utc": "2026-07-25T07:33:08.273332+00:00"
+    },
+    {
+      "value": "task6",
+      "slug": "task6",
+      "pid": 17280,
+      "extra_args": "--calibrate --calib-tasks 6 --taus 0.1 0.2 0.3 0.4 0.5 0.6 0.7 --ema-windows 1 5 15 40 80 --calib-alpha 0.1 --calib-steps 150 --n_tasks 8",
+      "cmd": "/Users/chunter/code/curtis/Synthetic2/infra/.venv/bin/python /Users/chunter/code/curtis/Synthetic2/infra/run_on_cloud.py --provider runpod --benchmark trace --gpu-type A40 --cloud SECURE --extra-args '--calibrate --calib-tasks 6 --taus 0.1 0.2 0.3 0.4 0.5 0.6 0.7 --ema-windows 1 5 15 40 80 --calib-alpha 0.1 --calib-steps 150 --n_tasks 8'",
+      "log_path": "lab_reports/_staging/_logs/trace_calib_20260725T073258Z_20260725T073258Z/arm_task6.nohup.log",
+      "pid_path": "lab_reports/_staging/_logs/trace_calib_20260725T073258Z_20260725T073258Z/arm_task6.pid",
+      "launched_utc": "2026-07-25T07:33:10.284529+00:00"
+    },
+    {
+      "value": "task7",
+      "slug": "task7",
+      "pid": 17338,
+      "extra_args": "--calibrate --calib-tasks 7 --taus 0.1 0.2 0.3 0.4 0.5 0.6 0.7 --ema-windows 1 5 15 40 80 --calib-alpha 0.1 --calib-steps 150 --n_tasks 8",
+      "cmd": "/Users/chunter/code/curtis/Synthetic2/infra/.venv/bin/python /Users/chunter/code/curtis/Synthetic2/infra/run_on_cloud.py --provider runpod --benchmark trace --gpu-type A40 --cloud SECURE --extra-args '--calibrate --calib-tasks 7 --taus 0.1 0.2 0.3 0.4 0.5 0.6 0.7 --ema-windows 1 5 15 40 80 --calib-alpha 0.1 --calib-steps 150 --n_tasks 8'",
+      "log_path": "lab_reports/_staging/_logs/trace_calib_20260725T073258Z_20260725T073258Z/arm_task7.nohup.log",
+      "pid_path": "lab_reports/_staging/_logs/trace_calib_20260725T073258Z_20260725T073258Z/arm_task7.pid",
+      "launched_utc": "2026-07-25T07:33:12.292747+00:00"
+    }
+  ]
+}
