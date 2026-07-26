@@ -36,6 +36,8 @@ not a baseline to standardize onto EWC accumulation.
 
 from __future__ import annotations
 
+import os
+
 from baselines.base import Arm, DegenerateSignalError
 
 
@@ -82,10 +84,38 @@ def load_signal_tuning(path=None) -> dict:
     return {}
 
 
-def _apply_signal_tuning(arm, tuning: dict) -> None:
-    """Overwrite alpha/beta/ema_window from calib recommendation when present."""
+def _apply_signal_tuning(arm, tuning: dict, allow_unconfirmed: bool = False) -> None:
+    """Overwrite alpha/beta/ema_window from calib recommendation when present.
+
+    SAFETY GATE (DN02 "measured != selectable"): a signal_tuning.json produced
+    from init-signal calibration carries ``confirmation_required: true`` until a
+    post-1-epoch-task0 confirmation cell agrees on the mass split. We refuse to
+    silently lock unconfirmed calibration into a scored arm -- the merge writer
+    already gates *writing* the file behind --allow-unconfirmed, and this closes
+    the same gap at the *consumption* point. Set env SM_ALLOW_UNCONFIRMED_TUNING=1
+    or pass allow_unconfirmed=True to intentionally use unconfirmed tuning.
+    """
     if not tuning:
         return
+    needs_conf = bool(tuning.get("confirmation_required", False))
+    env_ok = os.environ.get("SM_ALLOW_UNCONFIRMED_TUNING", "") == "1"
+    if needs_conf and not (allow_unconfirmed or env_ok):
+        src = tuning.get("_loaded_from", "<unknown>")
+        raise RuntimeError(
+            "refusing to apply UNCONFIRMED signal tuning to a mechanism arm: "
+            f"{src} has confirmation_required=true. Run the post-1-epoch-task0 "
+            "confirmation cell and clear the flag, or set "
+            "SM_ALLOW_UNCONFIRMED_TUNING=1 (or allow_unconfirmed=True) to "
+            "intentionally proceed. "
+            f"note: {tuning.get('confirmation_note', '')}"
+        )
+    if needs_conf:
+        print(
+            "[arm] WARNING: applying UNCONFIRMED signal tuning "
+            f"(confirmation_required=true) from {tuning.get('_loaded_from')} "
+            "because override was set. Results are exploratory, not locked.",
+            flush=True,
+        )
     if "alpha" in tuning:
         arm.alpha = float(tuning["alpha"])
     if "beta" in tuning:
@@ -93,6 +123,7 @@ def _apply_signal_tuning(arm, tuning: dict) -> None:
     if "ema_window" in tuning:
         arm.ema_window = int(tuning["ema_window"])
     arm._signal_tuning_source = tuning.get("_loaded_from")
+    arm._signal_tuning_confirmed = not needs_conf
 
 
 class _SignalRegArmBase(Arm):

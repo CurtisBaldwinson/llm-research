@@ -103,11 +103,22 @@ distribution-invariant.
    **not** arm defaults until confirmation agrees on mass split.
 4. **EMA window \(w\) is a swept axis** alongside \(\tau\): default grid
    \(w \in \{1, 5, 15, 40, 80\}\). Per-point steps = \(\max(150, 10\cdot w)\)
-   so high-\(w\) rows are warmed. **Adoptable range:** only \(w \le
-   \texttt{MAX\_ADOPTABLE\_EMA\_WINDOW}\) (= 15) may be selected as default-arm
-   or EMA-on winner. \(w \in \{40, 80\}\) stay in the measured map (curiosity /
-   over-smoothing boundary) but cannot win — high-\(w\) shrinks cross-task std
-   by washing signal, which is not a scientific improvement.
+   so high-\(w\) rows are warmed. **Adoptable range (data-grounded):** a window
+   is trustworthy only if its memory is short relative to real per-task training
+   length. TRACE trains **1 epoch over `n_train=5000` examples at
+   `batch_size=8` ≈ 625 steps/task** (`trace_data.build_trace_sequence`
+   `n_train=5000`; `run.py` `epochs=1`, `batch_size=8`). We pre-register the
+   ceiling at **≤ ~10% of that budget (~62 steps)**, so
+   \(\texttt{MAX\_ADOPTABLE\_EMA\_WINDOW} = 40\): \(w \in \{1,5,15,40\}\) are
+   selectable (\(w=40 \approx 6.4\%\) of a task), while \(w = 80\)
+   (\(\approx 12.8\%\)) stays in the measured map and on the frontier plot
+   (curiosity / over-smoothing boundary) but **cannot win** — a large window
+   mechanically shrinks cross-task `protected_frac_std` by washing signal, which
+   is a smoothing artifact, not a scientific improvement. **Change record:** this
+   ceiling was initially set to 15 by assumption, then raised to 40 on
+   2026-07-25 once the ~625-step per-task budget was measured from the real
+   TRACE loader; if a future run changes `n_train`/`batch_size`/`epochs`,
+   recompute the ceiling from the new per-task step count.
    **Verdict rule for EMA-on:** within the adoptable range, adopt \(w>1\) only
    if it **improves mass split**, or achieves a **material** std reduction
    (\(\ge 0.02\)) at a **comparable** protected fraction (within 0.10); std-alone
@@ -153,3 +164,100 @@ Commands:
     # after post-1-epoch-task0 confirmation:
     make run-bg BENCH=trace GPU=A40 CLOUD=SECURE \
       EXTRA_FLAGS='--extra-args --signal-tuning-json lab_reports/_staging/signal_tuning.json'
+
+## Results — 2026-07-25 init-signal calibration run (and a salvage)
+
+### What we ran and what happened
+
+Launched the pre-registered grid (\(\tau \in \{0.1\ldots0.7\}\),
+\(w \in \{1,5,15,40,80\}\)) as 8 parallel pods (one per TRACE task) on A40
+SECURE. **All 8 pods completed \(w \in \{1,5,15,40\}\) cleanly, then were
+killed within ~2 minutes of each other at ~90 min in, exactly as they entered
+the \(w=80\) block** — no Python traceback, no `_FAILED` marker. That
+simultaneous, exception-free death at the single most expensive step is the
+signature of an external kill (wall-clock / resource cap), not a code fault.
+Root cause: `_calib_steps_for_window(base, w) = max(base, 10w)` makes \(w=80\)
+cost **800 steps/point × 7 \(\tau\) = 5,600 passes/pod** for that block alone,
+which crossed the pod runtime/resource ceiling. See the mitigation below.
+
+Because the pods died before writing their native `calib_signal_shard*.json`,
+the per-point data existed only in each pod's `run.log` stdout. We **salvaged**
+it: parsed every `[calib]` line, reconstructed the selection-faithful subset of
+the point dicts (`frac_mid` derived as \(1-\text{near\_zero}-\text{locked\_hi}\);
+`mass_split_ok` parsed per line — 5 `locked_hi_heavy` flags at aggressive
+low-\(\tau\) corners were correctly captured), and reran the **real**
+`_build_lookup_and_recommend` + `merge_calib_shards.py` (no reimplementation).
+Every salvaged artifact is stamped `salvage.source = "log_salvage_from_run_log_stdout"`
+with `precision: percent fields 1-decimal; n/bc unavailable; windows_missing=[80]`.
+Honesty note: 1-decimal precision is sufficient to *select* an arm (the winner
+leads by whole points, not tenths); we do not quote salvaged std to 4 decimals
+as a headline figure.
+
+### The recommendation (merged across all 8 tasks, n=8 per row)
+
+**Adopted arm: \(\tau = 0.4\), EMA window \(w = 1\) (rank-only, no smoothing),
+\(\beta = 0.0667\).**
+
+| metric | value |
+|---|---|
+| protected_frac_mean | 55.1% (nearest adoptable row to the 50% target) |
+| protected_frac_std | ±0.2% across 8 tasks (real cross-task std) |
+| plastic_mid_frac | 16.5% |
+| near_zero_frac | 28.5% |
+| n_tasks / hard_degenerate / mass_fail / bc_warn | 8 / 0 / 0 / 0 |
+
+Single-task shards correctly returned `recommended=None` (each \((\tau,w)\) row
+has n=1 → `protected_frac_std=None` → fails `_row_selectable_for_verdict`); the
+recommendation only emerges post-merge when every row reaches n=8. This is the
+min-n guard working as designed, not a defect.
+
+### Scientific verdict: rank alone suffices on TRACE
+
+The pre-registered EMA head-to-head (best rank-only vs. best adoptable EMA-on):
+
+| arm | \(\tau\) | \(w\) | protected | std | plastic_mid |
+|---|---|---|---|---|---|
+| rank-only | 0.4 | 1 | 55.1% | 0.0022 | **16.5%** |
+| best EMA-on | 0.5 | 40 | 46.4% | 0.0012 | **6.4%** |
+
+`adopt_ema_on = False`, `rationale = "rank_alone_suffices"`,
+`both_real_std = True`, `comparable_protected = True`,
+`material_std_improvement = False`, `mass_split_improvement = False`.
+
+Interpretation: EMA-on (\(w=40\)) did lower std slightly (0.0012 vs 0.0022), but
+the reduction was **below the pre-registered 0.02 materiality threshold** and
+came at the cost of a **collapsed plastic band** (6.4% vs 16.5% mid) — the exact
+over-smoothing artifact we predicted the guard should refuse. So the sweep
+**affirmatively decided** that on TRACE the smoothing buys nothing real and the
+simplest signal (plain per-step rank) wins on its merits. This is the intended
+ideal-science outcome: the thesis is not "EMA smoothing helps"; on this
+benchmark it demonstrably does not, and we adopt rank-only accordingly. If a
+future benchmark shows a material EMA gain, the same guarded rule will adopt it.
+
+### Adoptable-window boundary confirmed empirically
+
+The \(w=40 \Rightarrow\) adoptable decision (ceiling raised 15→40 on data grounds,
+above) is retroactively supported: at \(\tau=0.5\), `near_zero` grows only
+mildly with \(w\) (≈43.5%→48.2% from \(w=1\) to \(w=40\)) — \(w=40\) still
+carries real signal rather than washing out. \(w=80\) remains a
+measured-but-non-adoptable probe and was the only casualty of the kill; since it
+can never be selected, its absence does not affect the recommendation.
+
+### Mitigation for the next run (implemented)
+
+To prevent a repeat of the \(w=80\) kill, per-window step cost is now capped
+(see `_CALIB_STEPS_HARD_CAP` in `run.py`): warm-up still scales as
+\(\max(\text{base}, 10w)\) but is clamped so no single point can run away with
+the pod's wall-clock budget. Routine runs may also omit \(w=80\) (it is
+non-adoptable by construction); it is retained in the grid only when explicitly
+probing the over-smoothing boundary.
+
+### Status of this result
+
+`confirmation_required = true` **still stands.** This is an **init-signal**
+calibration (fresh LoRA weights), not post-task M. Before locking \(\tau=0.4,
+w=1\) into the mechanism arms for a scored CL run, run the cheap
+post-1-epoch-task0 confirmation cell and verify the mass split holds on real
+post-task M. The salvage does not change this precondition; it was always
+required. Artifacts: `/tmp/calib_merged.json`,
+`/tmp/signal_tuning_salvaged.json` (salvage-stamped) on the dev Mac.

@@ -210,6 +210,37 @@ merge-calib:
 	@echo "signal_tuning -> $(SIGNAL_TUNING)  (confirmation_required=true)"
 	@echo "Fleet: EXTRA_FLAGS='--extra-args --signal-tuning-json $(SIGNAL_TUNING)'"
 
+## Confirm calibrated signal tuning against post-1-epoch-task0 M (DN02).
+## Trains task 0 for 1 epoch on a GPU, measures M at the recommended
+## (tau,w,beta), and clears confirmation_required iff the post-task mass
+## split stays healthy. Cheap: single point, single task. Dispatches to
+## the same cloud path as `make run`; results land back in _staging.
+## Usage: make confirm-tuning BENCH=trace [GPU=A40] [CLOUD=SECURE] [SIGNAL_TUNING=...]
+.PHONY: confirm-tuning
+confirm-tuning: key-$(PROVIDER)
+	@test -n "$(BENCH)" || \
+	    (echo "Usage: make confirm-tuning BENCH=trace [GPU=A40] [CLOUD=SECURE]" && exit 1)
+	@test -f benchmarks/$(BENCH)/signal_tuning.json || \
+	    (echo "ERROR: benchmarks/$(BENCH)/signal_tuning.json missing -- stage the calibrated tuning there first (it must live under benchmarks/$(BENCH)/ to be uploaded to the pod)." && exit 1)
+	$(SCRIPTS_PY) $(CLOUD_SCRIPT) --provider $(PROVIDER) --benchmark $(BENCH) $(GPU_FLAG) $(CLOUD_FLAG) \
+	    --extra-args '--confirm-signal-tuning signal_tuning.json' $(EXTRA_FLAGS)
+	@echo ""
+	@echo "==> Confirmation run finished. If CONFIRMED, the pod mirrored the"
+	@echo "    flag-cleared signal_tuning.json + signal_tuning_confirmation.json"
+	@echo "    into the pulled results dir. Promote it back with:"
+	@latest=$$(ls -1dt lab_reports/_staging/$(BENCH)_results_* 2>/dev/null | head -1); \
+	  if [ -n "$$latest" ] && [ -f "$$latest/results/signal_tuning.json" ]; then \
+	    if grep -q '\"confirmation_required\": false' "$$latest/results/signal_tuning.json"; then \
+	      cp "$$latest/results/signal_tuning.json" benchmarks/$(BENCH)/signal_tuning.json; \
+	      cp "$$latest/results/signal_tuning.json" lab_reports/_staging/signal_tuning.json; \
+	      echo "    CONFIRMED -> promoted flag-cleared tuning into benchmarks/$(BENCH)/ and _staging/."; \
+	    else \
+	      echo "    NOT CONFIRMED -> flag still true; see $$latest/results/signal_tuning_confirmation.json"; \
+	    fi; \
+	  else \
+	    echo "    (no mirrored tuning found under $$latest/results/ -- check the run log)"; \
+	  fi
+
 ## Follow the dispatcher.log of the most recent launch.
 tail:
 	@latest=$$(ls -td lab_reports/_staging/*_results_*/ lab_reports/_staging/_smokes/*_results_*/ 2>/dev/null | head -n1); \

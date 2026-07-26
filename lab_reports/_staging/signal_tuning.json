@@ -1,0 +1,14 @@
+{
+  "schema": "signal_tuning/v1",
+  "design_note": "02_signal_normalization_pivot",
+  "calibration_scope": "init_signal",
+  "alpha": 0.1,
+  "beta": 0.06666666666666668,
+  "tau": 0.4,
+  "ema_window": 1,
+  "normalization": "rank",
+  "protected_frac_mean": 0.55075,
+  "protected_frac_std": 0.002222048604328896,
+  "confirmation_required": true,
+  "confirmation_note": "Init-signal only. Run a post-1-epoch-task0 confirmation cell before treating these as locked arm defaults."
+}

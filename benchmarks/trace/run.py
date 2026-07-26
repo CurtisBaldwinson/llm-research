@@ -897,10 +897,17 @@ DEFAULT_CALIB_TAUS = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70]
 DEFAULT_CALIB_EMA_WINDOWS = [1, 5, 15, 40, 80]
 # Pre-registered protected-fraction frontier endpoints (DN02).
 PROTECTED_FRAC_TARGETS = [0.05, 0.10, 0.20, 0.40]
-# Over-smoothing guard: w=40 and w=80 are measured/mapped for curiosity and
-# boundary behavior, but never selectable as default-arm or EMA-on winners.
-# w<=15 remains adoptable (includes EMA-off w=1 and moderate EMA-on).
-MAX_ADOPTABLE_EMA_WINDOW = 15
+# Over-smoothing guard (data-grounded, DN02): an EMA window is only trustworthy
+# if its memory is short relative to real per-task training length. TRACE trains
+# 1 epoch over n_train=5000 examples at batch_size=8 => ~625 steps/task
+# (trace_data.build_trace_sequence n_train=5000; run.py epochs=1, batch_size=8).
+# Adoptable iff window <= ~10% of that budget (~62 steps): w in {1,5,15,40} pass
+# (w=40 ~= 6.4% of a task). w=80 (~12.8%) is measured + mapped + on the frontier
+# plot for curiosity/boundary behavior, but never selectable as a default-arm or
+# EMA-on winner, because a large window mechanically shrinks protected_frac_std
+# and would let the recommender adopt an over-smoothing artifact, not a better
+# signal. If a rerun changes n_train/batch_size/epochs, recompute this ceiling.
+MAX_ADOPTABLE_EMA_WINDOW = 40
 # Under-populated std guard: single-task rows report std=None (unknown), not
 # 0.0. Rows need at least this many tasks with a real protected fraction
 # before they may win selection / EMA-on verdict (same "measured≠selectable"
@@ -952,9 +959,36 @@ def _verdict_row_key(t: dict) -> tuple:
     )
 
 
+# Hard cap on per-point calibration steps. The warm-up rule (10*w) is what
+# killed the 2026-07-25 run: w=80 wants 800 steps/point x 7 taus = 5,600 passes
+# for that block alone, which crossed the pod wall-clock/resource ceiling and
+# SIGKILL-ed all 8 pods simultaneously (no traceback). We clamp so no single
+# point can run away with the pod budget. The cap is chosen ABOVE the warm-up
+# need of every *adoptable* window (w<=MAX_ADOPTABLE_EMA_WINDOW=40 -> 400 steps)
+# so adoptable rows stay fully warmed; only non-adoptable probes (w=80) are
+# clamped. If a window needs more warm-up than the cap allows, it is by
+# definition too large to be adoptable -- consistent with the over-smoothing
+# guard. See docs/design_notes/02 (Results 2026-07-25).
+_CALIB_STEPS_HARD_CAP = 450
+
+
 def _calib_steps_for_window(base_steps: int, ema_window: int) -> int:
-    """Warm EMA: steps = max(base, 10*w) so high-w rows are not under-warmed."""
-    return max(int(base_steps), 10 * int(ema_window))
+    """Warm EMA: steps = max(base, 10*w), clamped to _CALIB_STEPS_HARD_CAP.
+
+    The 10*w warm-up keeps high-w rows from being under-warmed; the hard cap
+    prevents a single expensive point (e.g. w=80 -> 800) from blowing the pod
+    wall-clock budget. Adoptable windows (w<=40 -> <=400) are unaffected.
+    """
+    want = max(int(base_steps), 10 * int(ema_window))
+    if want > _CALIB_STEPS_HARD_CAP:
+        print(
+            f"[calib] WARN: w={int(ema_window)} warm-up wants {want} steps > "
+            f"cap {_CALIB_STEPS_HARD_CAP}; clamping. This window is beyond the "
+            f"adoptable ceiling and is a non-adoptable probe; its stats are "
+            f"under-warmed and must not be treated as authoritative.",
+            flush=True,
+        )
+    return min(want, _CALIB_STEPS_HARD_CAP)
 
 
 def _resolve_calib_task_ids(
@@ -1386,6 +1420,263 @@ def write_signal_tuning_json(recommended: Dict, alpha: float, path: Path) -> Pat
 # CLI
 # ---------------------------------------------------------------------------
 
+
+
+# ---------------------------------------------------------------------------
+# Post-task0 confirmation cell (DN02).
+#
+# The init-signal calibration (calibrate_signal) measures M on FRESH LoRA-init
+# weights. That is enough to *select* an arm (tau*/w*/beta*) but NOT enough to
+# lock it into a scored CL run: the mass split we care about is the one that
+# holds on REAL post-task M, after the model has actually trained on a task.
+# signal_tuning.json therefore ships with confirmation_required=true, and the
+# arm-side gate (_apply_signal_tuning) refuses to apply it until this cell
+# clears the flag.
+#
+# This cell is deliberately cheap: it trains ONLY task 0 for --epochs epochs
+# (default 1), then measures M ONCE at the single recommended (tau*, w*, beta*)
+# point -- not the whole grid. It reuses the exact same measurement path as
+# calibrate_signal (MyelinState -> _accumulate_signal_into_M -> _bt_m_stats ->
+# _bt_hard_degenerate -> _bt_mass_split_health) so there is no second, drifting
+# definition of "healthy". The ONLY difference from calibration is the weights
+# under measurement: post-1-epoch-task0 instead of init.
+#
+# Pass criteria (all required):
+#   * not hard-degenerate,
+#   * mass_split_ok == True on post-task M,
+#   * protected_frac within CONFIRM_PROTECTED_TOL of the init-signal value
+#     (the arm we picked must still behave like the arm we measured).
+# On pass, the tuning file is rewritten with confirmation_required=false plus a
+# full audit block. On fail, the flag is left true and the reason is reported;
+# nothing is silently locked.
+# ---------------------------------------------------------------------------
+CONFIRM_PROTECTED_TOL = 0.12  # post-task protected_frac may drift +-12pp from
+# the init-signal value and still confirm; wider than calibration's cross-task
+# std because init->post-task is a genuine distribution shift, but tight enough
+# that a collapsed (near_zero_heavy) or saturated (locked_hi_heavy) split fails.
+
+
+def confirm_signal_tuning(
+    tuning_path,
+    *,
+    epochs: int = 1,
+    model_id: str = None,
+    data_root=None,
+    batch_size: int = 8,
+    max_len: int = 512,
+    lr: float = 1e-2,
+    task_idx: int = 0,
+) -> Dict:
+    """Confirm init-signal tuning against post-1-epoch-task0 M (DN02).
+
+    Trains task ``task_idx`` for ``epochs`` epochs, then measures M once at the
+    recommended (tau, w, beta) from ``tuning_path`` using the SAME path as
+    calibrate_signal. Rewrites the file with confirmation_required=false iff the
+    post-task mass split is healthy and protected_frac is comparable to the
+    init-signal value. Returns the confirmation record.
+    """
+    # Guard the gate's core premise: this is a POST-TASK confirmation. With
+    # epochs<1 the training loop below is skipped, so M would be measured on
+    # (essentially) init weights and could clear confirmation_required using the
+    # very init-signal evidence the gate exists to supersede. Refuse it. (Same
+    # "measured != selectable" discipline as the arm-side and merge-side gates.)
+    if int(epochs) < 1:
+        raise ValueError(
+            f"confirmation requires epochs >= 1 (got {epochs}); epochs<1 would "
+            "measure init-weight M and defeat the post-task gate"
+        )
+    if int(task_idx) < 0:
+        raise ValueError(f"task_idx must be >= 0 (got {task_idx})")
+
+    import json
+    from pathlib import Path
+
+    import torch
+
+    from trace_data import build_real_model
+    from arms_mechanism import _accumulate_signal_into_M
+    from synthetic_myelination import (
+        MyelinState, bimodality_coefficient, unpack_lm_batch,
+    )
+
+    _SIGNAL_TYPE = "grad_l2_per_neuron"
+
+    tuning_path = Path(tuning_path)
+    if not tuning_path.is_file():
+        raise ValueError(f"tuning file not found: {tuning_path}")
+    tuning = json.loads(tuning_path.read_text())
+    tau = float(tuning["tau"])
+    w = int(tuning["ema_window"])
+    alpha = float(tuning.get("alpha", 0.1))
+    beta = float(tuning.get("beta", _bt_beta_for_breakeven(alpha, tau)))
+    init_prot = tuning.get("protected_frac_mean")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, tokenizer = build_real_model(model_id, device)
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    sequence = build_task_sequence(
+        "trace", tokenizer=tokenizer, data_root=data_root,
+        batch_size=batch_size, max_len=max_len,
+    )
+    if task_idx >= len(sequence):
+        raise ValueError(
+            f"task_idx={task_idx} out of range (n_tasks={len(sequence)})"
+        )
+
+    print(
+        f"[confirm] POST-TASK{task_idx} scope device={device} tau={tau} w={w} "
+        f"alpha={alpha} beta={beta:.6f} epochs={epochs} "
+        f"init_signal_protected={init_prot}",
+        flush=True,
+    )
+
+    # --- train task_idx for `epochs` epochs (same inner loop as the harness) ---
+    train_loader = sequence[task_idx][0]
+    opt = torch.optim.Adam(
+        [p for p in model.parameters() if p.requires_grad], lr=lr
+    )
+    model.train()
+    n_batches = 0
+    for _ep in range(int(epochs)):
+        for batch in train_loader:
+            opt.zero_grad(set_to_none=True)
+            dev = next(model.parameters()).device
+            ids, labels, attention_mask = unpack_lm_batch(
+                batch, dev, pad_token_id=pad_token_id,
+            )
+            try:
+                loss = model(
+                    ids, labels=labels, attention_mask=attention_mask,
+                ).loss
+            except TypeError:
+                loss = model(ids, labels=labels).loss
+            loss.backward()
+            opt.step()
+            n_batches += 1
+    print(f"[confirm] trained task{task_idx}: {n_batches} batches", flush=True)
+
+    # --- measure M ONCE at the recommended point (identical to calibration) ---
+    for p in model.parameters():
+        p.grad = None
+    model.train()
+    myelin = MyelinState(
+        model, alpha=alpha, beta=beta,
+        use_asymptotic_lock=True, signal_type=_SIGNAL_TYPE,
+        normalization="rank", ema_window=int(w),
+    )
+    n_steps = _calib_steps_for_window(150, w)
+    a_diag = _accumulate_signal_into_M(
+        model, train_loader, myelin, torch,
+        n_steps=n_steps, pad_token_id=pad_token_id,
+        ema_window=int(w), track_tau=float(tau),
+    ) or {}
+    stats = _bt_m_stats(myelin, bimodality_coefficient)
+    hard = _bt_hard_degenerate(myelin)
+    mass = _bt_mass_split_health(stats)
+
+    post_prot = stats.get("frac_locked_hi")
+    prot_drift = (
+        None if (post_prot is None or init_prot is None)
+        else abs(float(post_prot) - float(init_prot))
+    )
+
+    reasons = []
+    if hard:
+        reasons.append(f"hard_degenerate={hard}")
+    if not mass["mass_split_ok"]:
+        reasons.append(f"mass_split={mass['mass_split_note']}")
+    if prot_drift is None:
+        reasons.append("protected_frac unavailable for drift check")
+    elif prot_drift > CONFIRM_PROTECTED_TOL:
+        reasons.append(
+            f"protected_frac drift {prot_drift:.3f} > tol "
+            f"{CONFIRM_PROTECTED_TOL} (init={init_prot}, post={post_prot})"
+        )
+    confirmed = not reasons
+
+    print(
+        f"[confirm] post-task M: %hi={None if post_prot is None else 100*post_prot:.1f} "
+        f"%mid={None if stats.get('frac_mid') is None else 100*stats['frac_mid']:.1f} "
+        f"%~0={None if stats.get('frac_near_zero') is None else 100*stats['frac_near_zero']:.1f} "
+        f"hard={'Y' if hard else 'n'} mass={mass['mass_split_note']} "
+        f"drift={'na' if prot_drift is None else f'{prot_drift:.3f}'} "
+        f"=> {'CONFIRMED' if confirmed else 'NOT CONFIRMED'}",
+        flush=True,
+    )
+
+    record = dict(
+        harness="confirm_signal_tuning",
+        design_note="02_signal_normalization_pivot",
+        confirmation_scope=f"post_epoch{epochs}_task{task_idx}",
+        tau=tau, ema_window=w, alpha=alpha, beta=beta,
+        init_signal_protected_frac=init_prot,
+        post_task_protected_frac=post_prot,
+        post_task_frac_mid=stats.get("frac_mid"),
+        post_task_frac_near_zero=stats.get("frac_near_zero"),
+        protected_frac_drift=prot_drift,
+        protected_frac_tol=CONFIRM_PROTECTED_TOL,
+        hard_degenerate=hard,
+        mass_split_ok=mass["mass_split_ok"],
+        mass_split_note=mass["mass_split_note"],
+        frac_A_above_tau_mean=a_diag.get("frac_A_above_tau_mean"),
+        steps=n_steps,
+        confirmed=confirmed,
+        not_confirmed_reasons=reasons,
+    )
+
+    if confirmed:
+        tuning["confirmation_required"] = False
+        tuning["confirmation"] = record
+        tuning["confirmation_note"] = (
+            f"CONFIRMED against post-epoch{epochs}-task{task_idx} M on "
+            f"{datetime.now(timezone.utc).date().isoformat()}: mass split "
+            f"healthy ({mass['mass_split_note']}), protected_frac drift "
+            f"{'na' if prot_drift is None else f'{prot_drift:.3f}'} within tol."
+        )
+        tuning_path.write_text(json.dumps(tuning, indent=2))
+        print(
+            f"[confirm] CONFIRMED — cleared confirmation_required in "
+            f"{tuning_path}; arms may now apply this tuning by default.",
+            flush=True,
+        )
+    else:
+        # Leave the file untouched (confirmation_required stays true). Emit the
+        # record next to it for the audit trail without poisoning the tuning.
+        audit = tuning_path.with_suffix(".confirmation_failed.json")
+        audit.write_text(json.dumps(record, indent=2))
+        print(
+            f"[confirm] NOT CONFIRMED — {'; '.join(reasons)}. Left "
+            f"confirmation_required=true in {tuning_path}; wrote {audit}. "
+            f"Arms will continue to refuse this tuning.",
+            flush=True,
+        )
+
+    # Mirror outputs into the results dir so they survive an ephemeral GPU pod.
+    # On the cloud the pod's filesystem (including tuning_path) is destroyed
+    # after the run; only $SYNTH_RESULTS_DIR is tar-pulled back to local
+    # staging. Without this, a CONFIRMED flag-clear would be lost with the pod.
+    results_dir = os.environ.get("SYNTH_RESULTS_DIR")
+    if results_dir:
+        rd = Path(results_dir)
+        try:
+            rd.mkdir(parents=True, exist_ok=True)
+            # the (possibly flag-cleared) tuning file, under its original name
+            (rd / tuning_path.name).write_text(json.dumps(tuning, indent=2))
+            # the confirmation record, always, for the audit trail
+            (rd / "signal_tuning_confirmation.json").write_text(
+                json.dumps(record, indent=2)
+            )
+            print(
+                f"[confirm] mirrored tuning + record into {rd} "
+                f"(survives pod teardown; pull these back to local staging).",
+                flush=True,
+            )
+        except OSError as exc:
+            print(f"[confirm] WARN: could not mirror to results dir: {exc}",
+                  flush=True)
+    return record
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1417,6 +1708,13 @@ def main():
     ap.add_argument("--signal-tuning-json", type=Path, default=None,
                     help="load signal_tuning.json (alpha/beta/ema_window) into "
                          "mechanism arms; also written by merge_calib_shards")
+    ap.add_argument("--confirm-signal-tuning", type=Path, default=None,
+                    help="DN02 post-1-epoch-task0 confirmation cell: train task "
+                         "0 for --epochs, measure M at the recommended "
+                         "(tau,w,beta) in this signal_tuning.json, and clear "
+                         "confirmation_required iff the post-task mass split is "
+                         "healthy and protected_frac is comparable. Cheap; "
+                         "single point, single task. Nothing else runs.")
     ap.add_argument("--arms", nargs="+", default=EXP1_ARMS)
     ap.add_argument("--seeds", type=int, nargs="+", default=None)
     ap.add_argument("--lambdas", type=float, nargs="+", default=None)
@@ -1472,6 +1770,21 @@ def main():
         tune_path.write_text(json.dumps(chosen, indent=2))
         print(f"[tune] written: {tune_path}")
         return
+
+    if args.confirm_signal_tuning is not None:
+        # DN02 post-1-epoch-task0 confirmation cell. Cheap single-point check
+        # that clears confirmation_required iff post-task M stays healthy.
+        rec = confirm_signal_tuning(
+            args.confirm_signal_tuning,
+            epochs=args.epochs,
+            model_id=args.model_id,
+            data_root=args.data_root,
+            batch_size=args.batch_size,
+            max_len=args.max_len,
+            lr=args.lr,
+        )
+        # Non-zero exit on failure so CI / make can gate on it.
+        sys.exit(0 if rec.get("confirmed") else 3)
 
     if args.calibrate:
         # Design Note 02 init-signal calibration (tau x ema_window).
