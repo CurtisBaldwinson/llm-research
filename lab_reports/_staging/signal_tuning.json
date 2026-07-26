@@ -8,7 +8,29 @@
   "ema_window": 1,
   "normalization": "rank",
   "protected_frac_mean": 0.55075,
-  "protected_frac_std": 0.002222048604328896,
-  "confirmation_required": true,
-  "confirmation_note": "Init-signal only. Run a post-1-epoch-task0 confirmation cell before treating these as locked arm defaults."
+  "protected_frac_std": 0.0022,
+  "confirmation_required": false,
+  "confirmation_note": "CONFIRMED against post-epoch1-task0 M on 2026-07-26: mass split healthy (ok), protected_frac drift 0.057 within tol.",
+  "confirmation": {
+    "harness": "confirm_signal_tuning",
+    "design_note": "02_signal_normalization_pivot",
+    "confirmation_scope": "post_epoch1_task0",
+    "tau": 0.4,
+    "ema_window": 1,
+    "alpha": 0.1,
+    "beta": 0.06666666666666668,
+    "init_signal_protected_frac": 0.55075,
+    "post_task_protected_frac": 0.6078710556030273,
+    "post_task_frac_mid": 0.1270507425069809,
+    "post_task_frac_near_zero": 0.26507821679115295,
+    "protected_frac_drift": 0.05712105560302738,
+    "protected_frac_tol": 0.12,
+    "hard_degenerate": null,
+    "mass_split_ok": true,
+    "mass_split_note": "ok",
+    "frac_A_above_tau_mean": 0.6126534640789032,
+    "steps": 150,
+    "confirmed": true,
+    "not_confirmed_reasons": []
+  }
 }
