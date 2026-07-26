@@ -116,6 +116,25 @@ _BASELINE_TUNING = {
     "model_averaging_alpha": DEFAULT_MODEL_AVERAGING_ALPHA,
 }
 
+#: Fix #2 (matched-plasticity frontier, 2026-07-25 review): the weight-space
+#: baselines are lambda-invariant, so at a single tuned operating point they
+#: are a DOT while the mechanism is a CURVE -- there is nothing to match M's
+#: plasticity against, and "M dominates" becomes an unmatched-plasticity
+#: artifact. To give each baseline its own plasticity frontier we sweep its
+#: native knob (rho for elastic_reset, alpha for model_averaging). Because
+#: these arms ignore lambda_reg, the swept knob value is carried in the
+#: lambda-key slot of results[arm]["lambda_runs"] (each cell tags sweep_knob/
+#: sweep_value for honest logs); _frontier_dominance then reads it exactly
+#: like the mechanism's lambda curve. The single tuned value from
+#: --tune-baselines is retained as the marked operating point on this curve,
+#: not discarded. Sweeping a knob these arms DO consume is a scientific
+#: comparison (a real baseline frontier), not the duplicate-recompute that
+#: LAMBDA_INVARIANT_ARMS trims away.
+BASELINE_SWEEPS = {
+    "elastic_reset": ("rho", [0.1, 0.3, 0.5, 0.7, 0.9]),
+    "model_averaging": ("alpha", [0.1, 0.3, 0.5, 0.7, 0.9]),
+}
+
 
 # ---------------------------------------------------------------------------
 # Task sequence abstraction
@@ -174,7 +193,11 @@ def _trace_sequence(tokenizer, data_root, batch_size: int = 8, max_len: int = 51
 
     Stages the official TRACE archive on first use (idempotent). On the pod the
     data isn't shipped in the code tar -- fetch_data.stage_trace() pulls it from
-    the official Google Drive release and normalizes it under <data_root>.
+    the official Google Drive release and normalizes it under <parent>/TRACE.
+
+    ``data_root`` may be either:
+      * the stage parent (e.g. HERE/data) -- stage_trace creates TRACE/ under it; or
+      * an already-staged task root (…/TRACE with ScienceQA/train.json present).
     """
     from pathlib import Path
     from trace_data import build_trace_sequence
@@ -182,17 +205,17 @@ def _trace_sequence(tokenizer, data_root, batch_size: int = 8, max_len: int = 51
     if tokenizer is None:
         raise ValueError("trace mode requires a tokenizer")
     if data_root is None:
-        # Default to a data/ dir NEXT TO this benchmark (HERE/data/TRACE), which
-        # is writable both locally (benchmarks/trace/data) and on the pod
-        # (REMOTE_BASE/trace/data). ROOT/parents[2] is unreliable on the pod.
-        data_root = HERE / "data" / "TRACE"
+        # Parent dir under which stage_trace creates TRACE/. Writable both
+        # locally (benchmarks/trace/data) and on the pod (REMOTE_BASE/trace/data).
+        data_root = HERE / "data"
     data_root = Path(data_root)
-    # Idempotent fetch-on-pod (and locally if absent); fails loud on network error.
-    # stage_trace() appends its own TRACE/ segment and returns the real staged
-    # dir (…/TRACE). build_trace_sequence() reads <root>/<task> directly, so it
-    # must receive that returned path, NOT the pre-stage data_root (otherwise the
-    # TRACE segment is doubled: data/TRACE/TRACE vs the expected data/TRACE).
-    staged_root = stage_trace(data_root)
+    # Accept an already-staged task root so --data_root …/TRACE keeps working.
+    if (data_root / "ScienceQA" / "train.json").exists():
+        staged_root = data_root
+    else:
+        # stage_trace(parent) creates <parent>/TRACE and returns that path.
+        # build_trace_sequence reads <root>/<task> directly.
+        staged_root = stage_trace(data_root)
     return build_trace_sequence(
         tokenizer=tokenizer,
         data_root=staged_root,
@@ -262,9 +285,13 @@ def evaluate(model, eval_loader, pad_token_id=None) -> float:
     from synthetic_myelination import unpack_lm_batch
 
     model.eval()
-    correct = 0
-    total = 0
     device = next(model.parameters()).device
+    # Output-preserving perf (2026-07-26 efficiency review): accumulate the
+    # correct/total counts as int64 tensors ON GPU and synchronize to the host
+    # exactly ONCE per loader, instead of two .item() device->host syncs per
+    # batch. The arithmetic is identical; only the number of stalls changes.
+    correct = torch.zeros((), dtype=torch.long, device=device)
+    total = torch.zeros((), dtype=torch.long, device=device)
     with torch.no_grad():
         for batch in eval_loader:
             ids, labels, attention_mask = unpack_lm_batch(
@@ -278,9 +305,11 @@ def evaluate(model, eval_loader, pad_token_id=None) -> float:
             gold = labels[:, 1:]
             # Valid where gold is not ignore_index (-100)
             valid = gold != -100
-            correct += ((pred == gold) & valid).sum().item()
-            total += valid.sum().item()
-    return correct / total if total else 0.0
+            correct += ((pred == gold) & valid).sum()
+            total += valid.sum()
+    total_i = int(total.item())  # single sync
+    correct_i = int(correct.item())  # single sync
+    return correct_i / total_i if total_i else 0.0
 
 
 def run_arm_over_sequence(
@@ -362,11 +391,71 @@ def run_arm_over_sequence(
 # Orchestration
 # ---------------------------------------------------------------------------
 
+def _seeded_sequence(sequence, seed, mode, batch_size, fixed_train_order=False,
+                     crop_batches=False, sort_eval_batches=False):
+    """Return a per-seed view of ``sequence`` with train example order permuted.
+
+    Turns the ``seeds`` axis into genuine replicates: each seed visits the
+    within-task training examples in a different (seeded) order, producing
+    independent SGD trajectories and non-degenerate across-seed variance. The
+    *task* sequence order and the eval loaders are left untouched -- only the
+    within-task training order varies, so it is a clean replicate mechanism,
+    not a change to the experimental design.
+
+    For ``smoke`` mode the synthetic sequence is already seeded at build time,
+    so we return it unchanged. If ``fixed_train_order`` is set (debug/escape
+    hatch), the original order is preserved and seeds collapse to identical
+    runs -- only use this to reproduce the old deterministic behavior.
+
+    Batch 2 efficiency transforms (both OFF by default, gated by a passing
+    real-model preflight before any scored run -- see main()):
+      * ``sort_eval_batches`` -- regroup each eval loader by real length so the
+        subsequent crop trims more. Output-preserving for AGGREGATE eval metrics
+        only (see trace_data.sort_eval_loader_by_length). Applied to eval
+        loaders only; train loaders keep their seeded order (sorting train would
+        destroy the replicate mechanism above).
+      * ``crop_batches`` -- drop shared padding columns from every train AND
+        eval batch. Forward-equivalent under a correct attention mask (see
+        trace_data.crop_batch_padding). Applied LAST so it also crops the
+        length-sorted eval batches.
+    Both are no-ops for ``smoke``/``fixed_train_order`` paths only where noted;
+    cropping is safe to apply in all real modes. They are kept here so both
+    run() call sites get identical treatment from one place.
+    """
+    from trace_data import (
+        reshuffle_train_loader, crop_loader_padding, sort_eval_loader_by_length,
+    )
+
+    # 1. seeded train-order replicate view (unchanged behavior)
+    if fixed_train_order or mode != "trace":
+        seq = sequence
+    else:
+        seq = [
+            (reshuffle_train_loader(train_loader, seed, batch_size), eval_loader)
+            for (train_loader, eval_loader) in sequence
+        ]
+
+    if not (crop_batches or sort_eval_batches):
+        return seq  # fast path: exact legacy behavior
+
+    out = []
+    for train_loader, eval_loader in seq:
+        ev = eval_loader
+        if sort_eval_batches:
+            ev = sort_eval_loader_by_length(ev, batch_size)
+        if crop_batches:
+            train_loader = crop_loader_padding(train_loader)
+            ev = crop_loader_padding(ev)
+        out.append((train_loader, ev))
+    return out
+
+
 def run(mode: str, arms: List[str], seeds: List[int], lambdas: List[float],
         n_tasks: int, lr: float, epochs: int,
         model_id: str = None, data_root=None,
         batch_size: int = 8, max_len: int = 512, ckpt_dir=None,
-        baseline_tuning: Dict = None) -> Dict:
+        baseline_tuning: Dict = None, fixed_train_order: bool = False,
+        crop_batches: bool = False, sort_eval_batches: bool = False) -> Dict:
     """Run the arms x seeds x lambdas matrix.
 
     Robustness (added 2026-07-24):
@@ -429,19 +518,31 @@ def run(mode: str, arms: List[str], seeds: List[int], lambdas: List[float],
     pristine = copy.deepcopy({k: v.detach().cpu() for k, v in model.state_dict().items()})
     print(f"[run] snapshotted {len(pristine)} tensors as pristine init", flush=True)
 
-    # Honest cell count: lambda-invariant arms run at ONE lambda, not len(lambdas).
-    _lam_arms = [a for a in arms if a not in LAMBDA_INVARIANT_ARMS]
-    _inv_arms = [a for a in arms if a in LAMBDA_INVARIANT_ARMS]
-    total_cells = (len(lambdas) * len(_lam_arms) + len(_inv_arms)) * len(seeds)
+    # Build each arm's list of operating points along its plasticity frontier.
+    #   * lambda-consuming arms  -> the full lambda grid (knob = lambda)
+    #   * swept baselines (ER/MA)-> their native knob grid from BASELINE_SWEEPS
+    #     (knob = rho/alpha), carried in the lambda-key slot; the tuned value
+    #     from --tune-baselines is retained as the marked operating point.
+    #   * other lambda-invariant arms (vanilla) -> a SINGLE point at lambdas[0]
+    # Each point = (cell_key, construct_lam, sweep_override). cell_key is what
+    # goes into results[...]["lambda_runs"] and the checkpoint filename.
+    def _arm_points(arm_name):
+        if arm_name in BASELINE_SWEEPS:
+            knob, grid = BASELINE_SWEEPS[arm_name]
+            return [(str(v), lambdas[0], (knob, v)) for v in grid]
+        if arm_name in LAMBDA_INVARIANT_ARMS:
+            return [(str(lambdas[0]), lambdas[0], None)]
+        return [(str(l), l, None) for l in lambdas]
+
+    arm_points = {a: _arm_points(a) for a in arms}
+    # Honest cell count: sum of each arm's operating points x seeds.
+    total_cells = sum(len(pts) for pts in arm_points.values()) * len(seeds)
     done = 0
     t_matrix = time.time()
 
-    for lam_idx, lam in enumerate(lambdas):
-        for arm_name in arms:
-            # Lambda-invariant arms (see LAMBDA_INVARIANT_ARMS) produce identical
-            # cells for every lambda; run them once at the first lambda only.
-            if arm_name in LAMBDA_INVARIANT_ARMS and lam_idx != 0:
-                continue
+    for arm_name in arms:
+        for cell_key, construct_lam, sweep_override in arm_points[arm_name]:
+            lam = cell_key  # checkpoint/results key (lambda value or swept knob)
             per_seed_metrics = []
             for seed in seeds:
                 done += 1
@@ -454,6 +555,14 @@ def run(mode: str, arms: List[str], seeds: List[int], lambdas: List[float],
 
                 model.load_state_dict(pristine, strict=True)
                 torch.manual_seed(seed)
+                # Per-seed training-example order => genuine replicates
+                # (see _seeded_sequence / reshuffle_train_loader).
+                seed_sequence = _seeded_sequence(
+                    sequence, seed, mode, batch_size,
+                    fixed_train_order=fixed_train_order,
+                    crop_batches=crop_batches,
+                    sort_eval_batches=sort_eval_batches,
+                )
 
                 t0 = time.time()
                 print("[cell %d/%d] START lam=%s arm=%s seed=%s"
@@ -461,13 +570,14 @@ def run(mode: str, arms: List[str], seeds: List[int], lambdas: List[float],
 
                 ArmCls = ALL_ARMS[arm_name]
                 arm = _construct_arm(
-                    ArmCls, lam, seed,
+                    ArmCls, construct_lam, seed,
                     pad_token_id=pad_token_id,
                     baseline_tuning=tuning,
+                    sweep_override=sweep_override,
                 )
                 try:
                     out = run_arm_over_sequence(
-                        arm, model, sequence, lr, epochs,
+                        arm, model, seed_sequence, lr, epochs,
                         pad_token_id=pad_token_id,
                     )
                 except DegenerateSignalError as exc:
@@ -566,13 +676,27 @@ def run(mode: str, arms: List[str], seeds: List[int], lambdas: List[float],
             live = [m for m in per_seed_metrics if not m.get("degenerate")]
             bwts = [m["metrics"]["bwt"] for m in live]
             targ = [m["metrics"]["target_task_acc"] for m in live]
-            results[arm_name]["lambda_runs"][str(lam)] = {
+            cell_agg = {
                 "bwt": mean_std(bwts),
                 "target_task_acc": mean_std(targ),
                 "per_seed": per_seed_metrics,
                 "n_degenerate": sum(1 for m in per_seed_metrics if m.get("degenerate")),
                 "metric_scope": METRIC_SCOPE,
             }
+            # Honest logs: tag which knob this frontier point swept and whether
+            # it is the tuned operating point retained from --tune-baselines.
+            if sweep_override is not None:
+                knob, val = sweep_override
+                tuned_val = tuning.get(f"{arm_name}_{knob}")
+                cell_agg["sweep_knob"] = knob
+                cell_agg["sweep_value"] = float(val)
+                cell_agg["is_tuned_operating_point"] = bool(
+                    tuned_val is not None
+                    and abs(float(tuned_val) - float(val)) < 1e-9
+                )
+            else:
+                cell_agg["sweep_knob"] = "lambda"
+            results[arm_name]["lambda_runs"][str(lam)] = cell_agg
     print("[run] matrix complete: %d/%d cells in %.1f min"
           % (done, total_cells, (time.time() - t_matrix) / 60), flush=True)
     results["_baseline_tuning"] = tuning
@@ -581,12 +705,18 @@ def run(mode: str, arms: List[str], seeds: List[int], lambdas: List[float],
 
 
 def _construct_arm(ArmCls, lam: float, seed: int, pad_token_id=None,
-                   baseline_tuning: Dict = None):
+                   baseline_tuning: Dict = None, sweep_override=None):
     """Construct an arm with λ, seed, pad id, and fixed weight-space knobs.
 
     Weight-space ``alpha`` (model averaging) and M-dynamics ``alpha`` share a
     name — only pass the weight-space value to ModelAveragingArm so we do not
     silently retune MyelinState.
+
+    ``sweep_override`` (Fix #2): a (knob_name, value) pair that overrides the
+    fixed tuned weight-space knob for this cell, used to trace a baseline's
+    plasticity frontier (see BASELINE_SWEEPS). When set for elastic_reset it
+    supplies ``rho``; for model_averaging it supplies ``alpha``. It NEVER
+    touches mechanism dynamics.
     """
     tuning = baseline_tuning or _BASELINE_TUNING
     name = getattr(ArmCls, "name", "")
@@ -595,11 +725,18 @@ def _construct_arm(ArmCls, lam: float, seed: int, pad_token_id=None,
         "seed": seed,
         "pad_token_id": pad_token_id,
     }
+    ovr_knob, ovr_val = (sweep_override or (None, None))
     if name == "elastic_reset":
-        kw["rho"] = tuning.get("elastic_reset_rho", DEFAULT_ELASTIC_RESET_RHO)
+        kw["rho"] = (
+            float(ovr_val) if ovr_knob == "rho"
+            else tuning.get("elastic_reset_rho", DEFAULT_ELASTIC_RESET_RHO)
+        )
     if name == "model_averaging":
-        kw["alpha"] = tuning.get(
-            "model_averaging_alpha", DEFAULT_MODEL_AVERAGING_ALPHA
+        kw["alpha"] = (
+            float(ovr_val) if ovr_knob == "alpha"
+            else tuning.get(
+                "model_averaging_alpha", DEFAULT_MODEL_AVERAGING_ALPHA
+            )
         )
     # Mechanism arms: explicit signal_tuning dict suppresses auto filesystem load.
     if name in ("gradient_aligned_m", "raw_fisher_signal",
@@ -627,6 +764,113 @@ def _live_seed_metrics(run_dict: dict, key: str) -> List[float]:
         if key in m and m[key] == m[key]:  # reject NaN
             out.append(float(m[key]))
     return out
+
+
+def _frontier_dominance(
+    mech_block: dict,
+    base_block: dict,
+    *,
+    plasticity_tol: float = 0.02,
+) -> Dict:
+    """Matched-plasticity Pareto-frontier dominance of mechanism over a baseline.
+
+    This is the honest replacement for the old single-``best_lambda`` comparison,
+    which let each arm cherry-pick its own most-flattering operating point and so
+    could report a "win" that was really just an unmatched-plasticity artifact.
+
+    Both arms expose a plasticity frontier through their ``lambda_runs`` map --
+    for the mechanism the knob is lambda; for the (formerly lambda-invariant)
+    weight-space baselines the same key slot carries the swept rho/alpha value
+    (see BASELINE_SWEEPS). For EACH mechanism operating point we:
+      1. find the baseline point at MATCHED plasticity (min |delta target-task
+         NTA|, and only if within ``plasticity_tol``), then
+      2. test whether the mechanism's BWT beats that matched baseline point by
+         >2 sigma at n>=5 (exceeds_2sigma).
+    The mechanism DOMINATES at a point iff a matched baseline point exists and
+    the 2-sigma BWT gate passes there. We report per-point results, the total
+    number of dominated points, and the longest contiguous dominated run along
+    the mechanism's sorted frontier (a Pareto-region summary, not a single dot).
+
+    Returns ``available=0.0`` with a reason when either arm is missing/empty.
+    """
+    m_runs = (mech_block or {}).get("lambda_runs", {}) or {}
+    b_runs = (base_block or {}).get("lambda_runs", {}) or {}
+    if not m_runs or not b_runs:
+        return {"available": 0.0, "reason": "missing arm or empty runs"}
+
+    # Pre-extract baseline curve (BWT + plasticity per baseline knob point).
+    base_points = []
+    for b_key, b_run in b_runs.items():
+        b_bwt = _live_seed_metrics(b_run, "bwt")
+        b_targ = _live_seed_metrics(b_run, "target_task_acc")
+        if not b_bwt or not b_targ:
+            continue
+        base_points.append({
+            "key": b_key,
+            "bwt": b_bwt,
+            "targ": b_targ,
+            "targ_mean": sum(b_targ) / len(b_targ),
+        })
+    if not base_points:
+        return {"available": 0.0, "reason": "baseline has no live points"}
+
+    per_point = []
+    # Sort mechanism points numerically along its frontier for the contiguity run.
+    def _as_float(k):
+        try:
+            return float(k)
+        except (TypeError, ValueError):
+            return float("inf")
+
+    for m_key in sorted(m_runs.keys(), key=_as_float):
+        m_run = m_runs[m_key]
+        mech_bwt = _live_seed_metrics(m_run, "bwt")
+        mech_t = _live_seed_metrics(m_run, "target_task_acc")
+        if not mech_bwt or not mech_t:
+            per_point.append({
+                "mechanism_point": m_key, "matched": 0.0,
+                "reason": "mechanism point empty", "dominates": 0.0,
+            })
+            continue
+        mech_t_mean = sum(mech_t) / len(mech_t)
+        # Closest baseline point in plasticity space.
+        nearest = min(
+            base_points, key=lambda bp: abs(bp["targ_mean"] - mech_t_mean)
+        )
+        plast = matched_plasticity(mech_t, nearest["targ"], tol=plasticity_tol)
+        entry = {
+            "mechanism_point": m_key,
+            "matched_baseline_point": nearest["key"],
+            **{f"plasticity_{k}": v for k, v in plast.items()},
+        }
+        if plast["matched"] <= 0:
+            entry.update({"dominates": 0.0,
+                          "reason": "no baseline point at matched plasticity"})
+            per_point.append(entry)
+            continue
+        gate = exceeds_2sigma(mech_bwt, nearest["bwt"])
+        entry.update({f"bwt_{k}": v for k, v in gate.items()})
+        entry["dominates"] = float(gate["passes_2sigma_n5"] > 0)
+        per_point.append(entry)
+
+    dominated_flags = [p.get("dominates", 0.0) > 0 for p in per_point]
+    n_dominated = sum(1 for f in dominated_flags if f)
+    max_contig = 0
+    cur = 0
+    for f in dominated_flags:
+        cur = cur + 1 if f else 0
+        max_contig = max(max_contig, cur)
+
+    return {
+        "available": 1.0,
+        "n_mechanism_points": len(per_point),
+        "n_dominated_points": n_dominated,
+        "max_contiguous_dominated": max_contig,
+        # Headline: dominates if it wins a nontrivial contiguous frontier region
+        # at matched plasticity + 2 sigma (not a single cherry-picked point).
+        "passes_frontier_dominance": float(max_contig >= 2),
+        "per_point": per_point,
+    }
 
 
 def decide(results: Dict) -> Dict:
@@ -666,29 +910,46 @@ def decide(results: Dict) -> Dict:
         }
 
     def _vs_baseline(base_name: str) -> Dict:
-        b_runs = results.get(base_name, {}).get("lambda_runs", {})
-        mb = best_lambda_run(results.get("gradient_aligned_m", {}))
-        bb = best_lambda_run(results.get(base_name, {}))
-        if mb is None or bb is None:
-            return {"available": 0.0, "reason": "missing arm or empty runs"}
-        m_lam, m_run = mb
-        b_lam, b_run = bb
-        mech_bwt = _live_seed_metrics(m_run, "bwt")
-        base_bwt = _live_seed_metrics(b_run, "bwt")
-        mech_t = _live_seed_metrics(m_run, "target_task_acc")
-        base_t = _live_seed_metrics(b_run, "target_task_acc")
-        gate = exceeds_2sigma(mech_bwt, base_bwt)
-        plast = matched_plasticity(mech_t, base_t)
-        return {
+        mech_block = results.get("gradient_aligned_m", {})
+        base_block = results.get(base_name, {})
+        # HEADLINE: matched-plasticity frontier dominance across the whole curve
+        # (replaces the old single best-lambda cherry-pick). See
+        # _frontier_dominance for the honest-comparison rationale.
+        frontier = _frontier_dominance(mech_block, base_block)
+        if frontier.get("available", 0.0) <= 0:
+            return frontier
+        out = {
             "available": 1.0,
-            "mechanism_best_lambda": m_lam,
-            "baseline_best_lambda": b_lam,
-            **gate,
-            **plast,
-            "passes_beat_baseline": float(
-                gate["passes_2sigma_n5"] > 0 and plast["matched"] > 0
-            ),
+            "passes_beat_baseline": frontier["passes_frontier_dominance"],
+            "frontier_dominance": frontier,
         }
+        # SECONDARY (labeled, non-headline): the old best-point readout is kept
+        # for continuity/diagnostics but is NOT the pass criterion, because
+        # independently best-lambda per arm compares at unmatched plasticity.
+        mb = best_lambda_run(mech_block)
+        bb = best_lambda_run(base_block)
+        if mb is not None and bb is not None:
+            m_lam, m_run = mb
+            b_lam, b_run = bb
+            gate = exceeds_2sigma(
+                _live_seed_metrics(m_run, "bwt"),
+                _live_seed_metrics(b_run, "bwt"),
+            )
+            plast = matched_plasticity(
+                _live_seed_metrics(m_run, "target_task_acc"),
+                _live_seed_metrics(b_run, "target_task_acc"),
+            )
+            out["best_point_diagnostic"] = {
+                "mechanism_best_lambda": m_lam,
+                "baseline_best_lambda": b_lam,
+                **gate,
+                **plast,
+                "note": (
+                    "diagnostic only; each arm at its own best lambda -> "
+                    "unmatched plasticity; not the pass criterion"
+                ),
+            }
+        return out
 
     beat_ewc = _vs_baseline("ewc")
     beat_er = _vs_baseline("elastic_reset")
@@ -751,6 +1012,9 @@ def tune_baselines(
     max_len: int = 512,
     rhos: List[float] = None,
     alphas: List[float] = None,
+    fixed_train_order: bool = False,
+    crop_batches: bool = False,
+    sort_eval_batches: bool = False,
 ) -> Dict:
     """Short 1-seed / 2-task pre-study for weight-space knobs.
 
@@ -784,12 +1048,21 @@ def tune_baselines(
         {k: v.detach().cpu() for k, v in model.state_dict().items()}
     )
 
+    # Use the SAME per-seed training-example order the scored run uses at this
+    # seed, so tuned baselines are selected under matched conditions. Match the
+    # scored run's batch transforms too (crop / length-sort), so tuning selects
+    # under identical batching.
+    seed_sequence = _seeded_sequence(
+        sequence, seed, mode, batch_size, fixed_train_order=fixed_train_order,
+        crop_batches=crop_batches, sort_eval_batches=sort_eval_batches,
+    )
+
     def _eval_arm(ArmCls, **kw):
         model.load_state_dict(pristine, strict=True)
         torch.manual_seed(seed)
         arm = ArmCls(lambda_reg=0.0, seed=seed, pad_token_id=pad_token_id, **kw)
         out = run_arm_over_sequence(
-            arm, model, sequence, lr, epochs, pad_token_id=pad_token_id,
+            arm, model, seed_sequence, lr, epochs, pad_token_id=pad_token_id,
         )
         return out["metrics"]["bwt"]
 
@@ -1724,6 +1997,133 @@ def confirm_signal_tuning(
     return record
 
 
+# ---------------------------------------------------------------------------
+# Batch 2 preflight gate
+# ---------------------------------------------------------------------------
+
+BATCH2_PREFLIGHT_FILENAME = "_batch2_preflight.json"
+
+
+def _current_git_commit() -> str:
+    """Best-effort git commit for binding a Batch 2 preflight artifact.
+
+    Preference order matches preflight_batch2._git_commit:
+      1. ``SYNTH_GIT_COMMIT`` (dispatcher stamps operator HEAD; pods have no
+         ``.git`` after tar-push).
+      2. ``git rev-parse HEAD`` from this file's directory (local hand-runs).
+      3. Empty string -- gate then matches model_id only (with a warning);
+         a missing commit must not silently open the gate.
+    """
+    import subprocess
+    env = (os.environ.get("SYNTH_GIT_COMMIT") or "").strip()
+    if env:
+        return env
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(Path(__file__).resolve().parent),
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+    except Exception:
+        return ""
+
+
+def _check_batch2_preflight(out_dir: Path, model_id: str,
+                            crop_batches: bool, sort_eval_batches: bool):
+    """Enforce the Batch 2 equivalence gate for a SCORED run.
+
+    A scored run with --crop-batches and/or --sort-eval-batches on must be able
+    to point at a preflight artifact (written by preflight_batch2.py) that:
+      * PASSED (crop logits/loss <=1e-5; sort aggregate accuracy exact), and
+      * covers the transform(s) actually enabled, and
+      * matches the current model_id, and
+      * matches the current git commit (when both are available).
+
+    Searches, in order: out_dir, out_dir.parent, and the run.py directory --
+    so the artifact can live next to results or next to the code. Raises
+    SystemExit(2) with an explicit reason if the gate is not satisfied. This is
+    the load-bearing guarantee that scored numbers were proven equivalent
+    BEFORE the fleet spent A40 hours producing them.
+    """
+    if not (crop_batches or sort_eval_batches):
+        return  # nothing enabled; gate is inert
+
+    search = [out_dir, out_dir.parent, Path(__file__).resolve().parent]
+    art_path = None
+    for d in search:
+        cand = d / BATCH2_PREFLIGHT_FILENAME
+        if cand.exists():
+            art_path = cand
+            break
+    if art_path is None:
+        print(
+            "[batch2] REFUSING scored run: --crop-batches/--sort-eval-batches "
+            "is set but no preflight artifact (%s) was found in %s. Run "
+            "preflight_batch2.py on the target A40 first, or use "
+            "--allow-batch2-without-preflight for a NON-scored probe only."
+            % (BATCH2_PREFLIGHT_FILENAME, [str(d) for d in search]),
+            file=sys.stderr, flush=True,
+        )
+        sys.exit(2)
+
+    art = json.loads(art_path.read_text())
+    problems = []
+    if not art.get("passed", False):
+        problems.append("artifact reports passed=false")
+    if art.get("model_id") != model_id:
+        problems.append(
+            f"model_id mismatch: artifact={art.get('model_id')!r} run={model_id!r}"
+        )
+    cur_commit = _current_git_commit()
+    art_commit = art.get("git_commit", "")
+    if cur_commit and art_commit:
+        if cur_commit != art_commit:
+            problems.append(
+                f"git commit mismatch: artifact={art_commit[:12]} "
+                f"run={cur_commit[:12]} (re-run preflight after code changes)"
+            )
+    else:
+        print(
+            "[batch2] WARNING: git commit unavailable for %s; gate matched on "
+            "model_id only. Ensure the preflight was produced from this exact "
+            "code." % ("artifact" if not art_commit else "run"),
+            file=sys.stderr, flush=True,
+        )
+    # Each enabled transform must be individually proven in the artifact.
+    checks = art.get("checks", {})
+    if crop_batches:
+        c = checks.get("crop", {})
+        if not c.get("passed", False):
+            problems.append(
+                "crop transform not proven in artifact (checks.crop.passed "
+                "is not true)"
+            )
+    if sort_eval_batches:
+        s = checks.get("sort_eval", {})
+        if not s.get("passed", False):
+            problems.append(
+                "sort_eval transform not proven in artifact "
+                "(checks.sort_eval.passed is not true)"
+            )
+    if problems:
+        print(
+            "[batch2] REFUSING scored run: preflight artifact %s does not "
+            "authorize this configuration:\n  - %s\nRe-run preflight_batch2.py "
+            "on the target A40 for this model + commit, or use "
+            "--allow-batch2-without-preflight for a NON-scored probe."
+            % (art_path, "\n  - ".join(problems)),
+            file=sys.stderr, flush=True,
+        )
+        sys.exit(2)
+    print(
+        "[batch2] preflight OK: %s (crop=%s sort_eval=%s, model=%s, "
+        "commit=%s) authorizes this scored run."
+        % (art_path.name, crop_batches, sort_eval_batches, model_id,
+           (art_commit[:12] or "n/a")),
+        flush=True,
+    )
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1775,9 +2175,40 @@ def main():
                     default="meta-llama/Llama-3.2-3B-Instruct",
                     help="HF base model for the real TRACE run")
     ap.add_argument("--data_root", type=Path, default=None,
-                    help="dir holding the official TRACE task folders")
+                    help="TRACE task-folder root (…/TRACE) or parent dir to "
+                         "stage into (default: <bench>/data -> …/data/TRACE)")
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--max_len", type=int, default=512)
+    ap.add_argument("--fixed-train-order", dest="fixed_train_order",
+                    action="store_true",
+                    help="DEBUG ONLY: disable per-seed training-example "
+                         "shuffling, so all seeds train on identical data "
+                         "order (reproduces the old deterministic behavior; "
+                         "collapses the seed axis to n=1 -- do NOT use for a "
+                         "run of record).")
+    ap.add_argument("--crop-batches", dest="crop_batches",
+                    action="store_true",
+                    help="EFFICIENCY (Batch 2): drop shared padding columns "
+                         "from every train/eval batch. Forward-equivalent under "
+                         "a correct attention mask. A SCORED run refuses to "
+                         "start with this on unless preflight_batch2.py has "
+                         "recorded a passing real-model equivalence proof for "
+                         "this model_id + git commit (see --allow-batch2-"
+                         "without-preflight to override for non-scored probes).")
+    ap.add_argument("--sort-eval-batches", dest="sort_eval_batches",
+                    action="store_true",
+                    help="EFFICIENCY (Batch 2): regroup eval examples by real "
+                         "length so cropping trims more (~halves eval "
+                         "positions). Output-preserving for AGGREGATE eval "
+                         "metrics ONLY -- unsafe with any per-example eval "
+                         "metric. Same preflight gate as --crop-batches.")
+    ap.add_argument("--allow-batch2-without-preflight",
+                    dest="allow_batch2_without_preflight",
+                    action="store_true",
+                    help="Override the Batch 2 preflight gate. ONLY for "
+                         "non-scored timing/smoke probes; a scored run with "
+                         "this set is refused (the whole point of the gate is "
+                         "that scored numbers are proven equivalent first).")
     args = ap.parse_args()
 
     mode = "smoke" if args.smoke else "trace"
@@ -1809,11 +2240,23 @@ def main():
     out.parent.mkdir(parents=True, exist_ok=True)
 
     if args.tune_baselines:
+        # Tuning selects operating points that feed the scored run, so it must
+        # use the SAME batch transforms. It is a short 1-seed/2-task pre-study
+        # (not a scored matrix), so the hard preflight gate does not apply here;
+        # but if the transforms are enabled we still print a reminder that the
+        # scored run will require the preflight.
+        if (args.crop_batches or args.sort_eval_batches):
+            print("[batch2] tune-baselines using crop=%s sort_eval=%s to match "
+                  "the scored run; remember the scored run itself still "
+                  "requires a passing preflight artifact."
+                  % (args.crop_batches, args.sort_eval_batches), flush=True)
         chosen = tune_baselines(
             mode, n_tasks=min(2, n_tasks), seed=(seeds[0] if seeds else 0),
             lr=args.lr, epochs=args.epochs, model_id=args.model_id,
             data_root=args.data_root, batch_size=args.batch_size,
-            max_len=args.max_len,
+            max_len=args.max_len, fixed_train_order=args.fixed_train_order,
+            crop_batches=args.crop_batches,
+            sort_eval_batches=args.sort_eval_batches,
         )
         tune_path = out.parent / "baseline_tuning.json"
         tune_path.write_text(json.dumps(chosen, indent=2))
@@ -1911,10 +2354,43 @@ def main():
 
     if signal_tuning:
         tuning["signal_tuning"] = signal_tuning
+    if args.fixed_train_order and not args.smoke:
+        print("[run] WARNING: --fixed-train-order set on a non-smoke run; the "
+              "seed axis will collapse to identical replicates (n=1). This is "
+              "NOT a valid run of record.", file=sys.stderr, flush=True)
+
+    # Batch 2 gate: a SCORED run (non-smoke run of record) may not enable the
+    # crop/sort transforms unless a matching preflight proof exists. --smoke is
+    # a preflight itself (never evidence), so it is exempt. The explicit
+    # override is allowed ONLY for non-scored probes and is refused here for a
+    # scored run.
+    scored_run = not args.smoke
+    if scored_run and (args.crop_batches or args.sort_eval_batches):
+        if args.allow_batch2_without_preflight:
+            print("[batch2] REFUSING: --allow-batch2-without-preflight cannot "
+                  "be used on a scored (non-smoke) run of record. Run "
+                  "preflight_batch2.py on the target A40 and let the gate pass.",
+                  file=sys.stderr, flush=True)
+            sys.exit(2)
+        _check_batch2_preflight(
+            out.parent, args.model_id,
+            args.crop_batches, args.sort_eval_batches,
+        )
+    elif (args.crop_batches or args.sort_eval_batches):
+        # smoke / non-scored: allowed, but only silently if the override is set;
+        # otherwise remind the operator this path is not gated.
+        if not args.allow_batch2_without_preflight:
+            print("[batch2] NOTE: crop/sort enabled on a non-scored (smoke) "
+                  "run; equivalence is NOT gated here. Use this only for "
+                  "timing/logic probes, never as evidence.", flush=True)
+
     results = run(mode, args.arms, seeds, lambdas, n_tasks, args.lr, args.epochs,
                   model_id=args.model_id, data_root=args.data_root,
                   batch_size=args.batch_size, max_len=args.max_len,
-                  ckpt_dir=ckpt_dir, baseline_tuning=tuning)
+                  ckpt_dir=ckpt_dir, baseline_tuning=tuning,
+                  fixed_train_order=args.fixed_train_order,
+                  crop_batches=args.crop_batches,
+                  sort_eval_batches=args.sort_eval_batches)
     relevance = decide(results)
 
     record = {
@@ -1929,6 +2405,10 @@ def main():
             "arms": args.arms, "seeds": seeds, "lambdas": lambdas,
             "n_tasks": n_tasks, "lr": args.lr, "epochs": args.epochs,
             "baseline_tuning": tuning,
+            "per_seed_train_shuffle": (not args.fixed_train_order),
+            "crop_batches": bool(args.crop_batches),
+            "sort_eval_batches": bool(args.sort_eval_batches),
+            "batch2_git_commit": _current_git_commit(),
             "phase1_isolation_screen": (
                 "gradient_aligned_m vs raw_fisher_signal; task-boundary M; "
                 "only use_asymptotic_lock differs"

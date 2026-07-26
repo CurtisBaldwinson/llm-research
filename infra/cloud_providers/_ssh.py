@@ -465,12 +465,14 @@ def build_remote_wrapper(
     """
     smoke_flag = "--smoke" if smoke else ""
     # The benchmark-deps install loop globs `{REMOTE_BASE}/*/requirements.txt`,
-    # which automatically picks up `{REMOTE_BASE}/_finalize/requirements.txt`
-    # iff push_finalize_payload() ran for this launch.  No special-case
-    # needed.
+    # which automatically picks up `{REMOTE_BASE}/{benchmark}/requirements.txt`
+    # AND `{REMOTE_BASE}/_finalize/requirements.txt` (iff push_finalize_payload()
+    # ran).  The benchmark path was ALSO listed explicitly before the glob,
+    # so it matched twice and pip installed the benchmark requirements twice
+    # per launch (2026-07-26 efficiency review). The explicit entry is dropped;
+    # the glob alone is sufficient and de-duplicated.
     install_cmd = (
         "for req in "
-        f'"{REMOTE_BASE}/{benchmark}/requirements.txt" '
         f'"{REMOTE_BASE}"/*/requirements.txt; do '
         'if [ -f "$req" ]; then '
         '  echo "    [pip] installing from $req (skipping torch)"; '
@@ -489,6 +491,23 @@ def build_remote_wrapper(
         else "# HF_TOKEN not set"
     )
 
+    # Stamp operator HEAD so pod-side gates (e.g. Batch 2 preflight) can bind
+    # artifacts to the exact code that was tar-pushed. Pods have no .git after
+    # push_code; without this export git_commit in artifacts is always empty.
+    git_commit = (os.environ.get("SYNTH_GIT_COMMIT") or "").strip()
+    if not git_commit:
+        try:
+            git_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+        except Exception:
+            git_commit = ""
+    git_export = (
+        f"export SYNTH_GIT_COMMIT={_sh_quote(git_commit)}" if git_commit
+        else "# SYNTH_GIT_COMMIT unavailable (no git / empty HEAD)"
+    )
+
     # Remote-finalize block, injected into the wrapper's EXIT path (after
     # the _DONE / _FINISHED sentinels are written, so the dispatcher's
     # poll loop has already detected completion and pulled results).
@@ -503,6 +522,7 @@ def build_remote_wrapper(
 # under nohup so it survives any SSH disconnect on the dispatcher side.
 set -u
 {hf_export}
+{git_export}
 RESULTS_DIR="{REMOTE_BASE}/{benchmark}/results"
 mkdir -p "$RESULTS_DIR"
 cd "{REMOTE_BASE}/{benchmark}"
@@ -514,6 +534,7 @@ STARTED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 touch "$RESULTS_DIR/_STARTED.$STARTED_UTC"
 echo "[wrapper] starting at $STARTED_UTC"
 echo "[wrapper] benchmark={benchmark} smoke={'1' if smoke else '0'}"
+echo "[wrapper] SYNTH_GIT_COMMIT=${{SYNTH_GIT_COMMIT:-}}"
 echo "[wrapper] PID=$$"
 
 # --- resolve a Python interpreter that actually has torch --------------------

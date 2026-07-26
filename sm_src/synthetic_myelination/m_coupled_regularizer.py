@@ -126,9 +126,20 @@ class MCoupledRegularizer:
         # θ_ref snapshot: param name → tensor on same device as param
         self._theta_ref: Dict[str, torch.Tensor] = {}
 
-        # Cached aggregate telemetry from last penalty() call
+        # Cached aggregate telemetry from last penalty() call.
+        # Materialized floats are computed lazily from the detached tensors
+        # below (see _sync_telemetry) so the hot path performs no per-step
+        # device->host syncs.
         self._last_penalty_value: float = 0.0
         self._last_per_layer_penalty: Dict[str, float] = {}
+        self._last_penalty_tensor = None
+        self._last_per_layer_tensors: Dict[str, "torch.Tensor"] = {}
+        self._telemetry_dirty: bool = False
+        self._telemetry_bypassed_lambda0: bool = False
+        # Per-layer telemetry is expensive (one detached tensor + eventual
+        # sync per layer). Off by default in the training hot loop; callers
+        # that need per-layer breakdowns set this True before penalty().
+        self.collect_per_layer: bool = False
 
     # ---------- Reference snapshot --------------------------------------
 
@@ -162,14 +173,44 @@ class MCoupledRegularizer:
         Fisher are state, not optimization targets).
 
         Returns a scalar Tensor on the same device as the model.
+
+        Hot-path efficiency (2026-07-26 review), all OUTPUT-PRESERVING for the
+        loss/gradients actually returned:
+          * lambda=0 bypass: at lambda_reg==0 the penalty contributes exactly
+            0 to the loss and 0 to every gradient, so we return a cached zero
+            scalar WITHOUT walking ~392 layers or building the graph. Telemetry
+            is set to a truthful zero state with bypassed_lambda0=True.
+          * Deferred telemetry: the per-step ``.item()`` device->host syncs
+            (one per layer + one aggregate, ~392/step for 3B+LoRA) were pure
+            telemetry. We now stash DETACHED tensors and materialize floats
+            lazily only when summary_stats()/per_layer_telemetry() is actually
+            read (see _sync_telemetry). The value returned into the loss is
+            byte-for-byte the same tensor math as before.
+          * Per-layer telemetry tensors are only retained when
+            self.collect_per_layer is True (default False in the training hot
+            loop); the differentiable ``total`` is always accumulated the same
+            way regardless.
         """
         if not self._theta_ref:
             raise RuntimeError(
                 "θ_ref is empty. Call snapshot_reference() before penalty()."
             )
 
+        device = next(self.model.parameters()).device
+
+        # --- lambda=0 bypass (loss- and gradient-preserving) ---------------
+        if self.lambda_reg == 0:
+            self._last_penalty_tensor = torch.zeros((), device=device)
+            self._last_per_layer_tensors = {}
+            self._telemetry_bypassed_lambda0 = True
+            # Invalidate any stale materialized cache.
+            self._last_penalty_value = 0.0
+            self._last_per_layer_penalty = {}
+            self._telemetry_dirty = False
+            return torch.zeros((), device=device)
+
         total = None
-        per_layer: Dict[str, float] = {}
+        per_layer_tensors: Dict[str, torch.Tensor] = {}
 
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
@@ -189,16 +230,44 @@ class MCoupledRegularizer:
             weighted = weight * diff_sq
             term = weighted.sum()
 
-            per_layer[name] = float(term.detach().item())
+            # Deferred telemetry: keep a DETACHED tensor (no host sync here).
+            if self.collect_per_layer:
+                per_layer_tensors[name] = term.detach()
             total = term if total is None else (total + term)
 
         if total is None:
-            return torch.tensor(0.0, device=next(self.model.parameters()).device)
+            self._last_penalty_tensor = torch.zeros((), device=device)
+            self._last_per_layer_tensors = {}
+            self._telemetry_bypassed_lambda0 = False
+            self._telemetry_dirty = True
+            return torch.zeros((), device=device)
 
         result = self.lambda_reg * total
-        self._last_penalty_value = float(result.detach().item())
-        self._last_per_layer_penalty = per_layer
+        # Stash detached tensors; materialize to float lazily on read.
+        self._last_penalty_tensor = result.detach()
+        self._last_per_layer_tensors = per_layer_tensors
+        self._telemetry_bypassed_lambda0 = False
+        self._telemetry_dirty = True
         return result
+
+    def _sync_telemetry(self) -> None:
+        """Materialize deferred penalty telemetry to Python floats.
+
+        Performs the device->host syncs that penalty() intentionally deferred,
+        but only when telemetry is actually requested (typically once per task,
+        not once per step). Idempotent between penalty() calls.
+        """
+        if not getattr(self, "_telemetry_dirty", False):
+            return
+        pen_t = getattr(self, "_last_penalty_tensor", None)
+        self._last_penalty_value = (
+            float(pen_t.item()) if pen_t is not None else 0.0
+        )
+        self._last_per_layer_penalty = {
+            n: float(t.item())
+            for n, t in getattr(self, "_last_per_layer_tensors", {}).items()
+        }
+        self._telemetry_dirty = False
 
     def _get_weight(
         self,
@@ -270,14 +339,24 @@ class MCoupledRegularizer:
 
     def summary_stats(self) -> Dict[str, float]:
         """Return aggregate stats for end-of-step logging."""
+        self._sync_telemetry()  # lazily materialize deferred penalty float
         return {
             "last_penalty": self._last_penalty_value,
             "n_theta_ref_params": float(len(self._theta_ref)),
             "lambda_reg": self.lambda_reg,
+            "penalty_bypassed_lambda0": float(
+                getattr(self, "_telemetry_bypassed_lambda0", False)
+            ),
         }
 
     def per_layer_telemetry(self) -> Dict[str, float]:
-        """Return per-layer penalty values from the last penalty() call."""
+        """Return per-layer penalty values from the last penalty() call.
+
+        Note: per-layer values are only populated when ``collect_per_layer``
+        was enabled during the penalty() call (default off in the training hot
+        loop to avoid ~392 device->host syncs/step). Returns {} otherwise.
+        """
+        self._sync_telemetry()
         return dict(self._last_per_layer_penalty)
 
 

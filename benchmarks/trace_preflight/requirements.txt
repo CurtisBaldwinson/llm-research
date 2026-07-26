@@ -1,0 +1,12 @@
+# trace_preflight reuses the trace benchmark's code, so its dependencies are
+# identical to benchmarks/trace/requirements.txt. torch is intentionally NOT
+# pinned (the dispatcher filters it out; the pod image's CUDA-matched build is
+# used). Kept in sync with trace on purpose.
+transformers>=4.40.0,<4.55
+datasets>=2.18.0,<4.0
+numpy>=1.26.0
+peft>=0.10,<0.13
+accelerate>=0.30,<1.0
+rouge-score>=0.1.2
+sacrebleu>=2.3.0
+gdown>=5.1.0

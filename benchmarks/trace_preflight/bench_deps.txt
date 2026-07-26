@@ -1,0 +1,5 @@
+# Sibling benchmark folders to push to the pod alongside trace_preflight.
+# trace_preflight reuses the REAL trace code (preflight_batch2.py, trace_data.py,
+# run.py, fetch_data.py, baselines/, sm_src is pushed separately) so there is a
+# single source of truth -- no duplicated preflight logic.
+trace

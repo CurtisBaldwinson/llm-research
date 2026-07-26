@@ -1,0 +1,7 @@
+{
+  "min_vram_gb": 24,
+  "required_compute_capability": "sm_80",
+  "preferred_gpus": ["A40", "A6000", "L40S", "A100-80GB", "RTX-6000-ADA"],
+  "remote_finalize": false,
+  "notes": "Batch 2 efficiency-transform equivalence preflight for the trace benchmark. Loads the real Llama-3.2-3B-Instruct + LoRA and proves, on the actual CUDA attention kernels, that (a) padding-crop preserves real-token logits + loss to <=1e-5 and (b) length-sorted eval preserves aggregate accuracy exactly. Writes _batch2_preflight.json into the results dir, which the dispatcher pulls home; commit it into benchmarks/trace/ so the scored run's gate authorizes --crop-batches/--sort-eval-batches for this model + git commit (SYNTH_GIT_COMMIT stamped by the wrapper). This is a SHORT single-GPU check (a few forward passes + one eval), not a matrix run, so remote_finalize is off (no lab report to render). Reuses the real trace code via bench_deps.txt (trace); A40 is the cheapest eligible card and the intended run environment. Run: make run BENCH=trace_preflight GPU=A40 CLOUD=SECURE. Override probes via EXTRA_FLAGS=\"--extra-args '--tol 1e-5 --n_probe_batches 6'\"."
+}
