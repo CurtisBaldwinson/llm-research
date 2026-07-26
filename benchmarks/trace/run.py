@@ -94,6 +94,20 @@ EXP1_ARMS = [
     "vanilla",              # sanity floor
 ]
 
+#: Arms whose behaviour does NOT depend on lambda_reg, verified against their
+#: source: sweeping lambda for these produces bit-identical cells, so the matrix
+#: runs them at a SINGLE lambda (the first in the grid) instead of the full
+#: sweep. This is not a scientific trim -- it removes duplicate recomputation
+#: and stops the logs from implying a lambda sensitivity these arms do not have.
+#: Evidence (grep the classes):
+#:   vanilla        -> VanillaArm.aux_loss returns None (no penalty term)
+#:   elastic_reset  -> lambda_reg declared "unused; kept for uniform construction"
+#:                     (driven by rho, fixed after --tune-baselines)
+#:   model_averaging-> self.lambda_reg referenced 0x in body (driven by alpha)
+#: The lambda-CONSUMING arms (gradient_aligned_m, raw_fisher_signal, ewc,
+#: replay) are deliberately excluded and keep their full sweep.
+LAMBDA_INVARIANT_ARMS = frozenset({"vanilla", "elastic_reset", "model_averaging"})
+
 DEFAULT_SEEDS = [0, 1, 2, 3, 4]   # n>=5 per README
 
 # Weight-space knobs fixed after pre-study; not swept in the main matrix.
@@ -312,8 +326,19 @@ def run_arm_over_sequence(
                 step_i += 1
         arm.on_task_end(model, i, train_loader)
         prev_loader = train_loader
-        # evaluate on all tasks seen so far (and future = 0 by convention)
-        for j, (_tl, ev) in enumerate(sequence):
+        # Evaluate ONLY tasks seen so far (j <= i). R was zero-initialised, so
+        # the strict upper triangle (future tasks, j > i) stays 0.0. Future-task
+        # cells are intentionally left at 0.0. This changes the raw upper triangle,
+        # but is lossless for the documented metrics because every metric in
+        # eval/metrics.py reads only the lower triangle:
+        #   backward_transfer -> final row R[T-1][j] + diagonal R[j][j]
+        #   average_accuracy  -> final row R[T-1][j]
+        #   learning_accuracy -> diagonal R[j][j]
+        #   target_task_acc   -> R[T-1][T-1]
+        # None read R[i][j] for j > i, so not computing them changes nothing.
+        # Removes ~44% of eval passes (28 of 64 task-evals over 8 tasks).
+        for j in range(i + 1):
+            ev = sequence[j][1]
             R[i][j] = evaluate(model, ev, pad_token_id=pad_token_id)
 
     arm.on_train_end(model)
@@ -404,12 +429,19 @@ def run(mode: str, arms: List[str], seeds: List[int], lambdas: List[float],
     pristine = copy.deepcopy({k: v.detach().cpu() for k, v in model.state_dict().items()})
     print(f"[run] snapshotted {len(pristine)} tensors as pristine init", flush=True)
 
-    total_cells = len(lambdas) * len(arms) * len(seeds)
+    # Honest cell count: lambda-invariant arms run at ONE lambda, not len(lambdas).
+    _lam_arms = [a for a in arms if a not in LAMBDA_INVARIANT_ARMS]
+    _inv_arms = [a for a in arms if a in LAMBDA_INVARIANT_ARMS]
+    total_cells = (len(lambdas) * len(_lam_arms) + len(_inv_arms)) * len(seeds)
     done = 0
     t_matrix = time.time()
 
-    for lam in lambdas:
+    for lam_idx, lam in enumerate(lambdas):
         for arm_name in arms:
+            # Lambda-invariant arms (see LAMBDA_INVARIANT_ARMS) produce identical
+            # cells for every lambda; run them once at the first lambda only.
+            if arm_name in LAMBDA_INVARIANT_ARMS and lam_idx != 0:
+                continue
             per_seed_metrics = []
             for seed in seeds:
                 done += 1
@@ -1594,10 +1626,14 @@ def confirm_signal_tuning(
         )
     confirmed = not reasons
 
+    hi_display = "na" if post_prot is None else f"{100 * post_prot:.1f}"
+    mid = stats.get("frac_mid")
+    mid_display = "na" if mid is None else f"{100 * mid:.1f}"
+    near_zero = stats.get("frac_near_zero")
+    near_zero_display = "na" if near_zero is None else f"{100 * near_zero:.1f}"
     print(
-        f"[confirm] post-task M: %hi={None if post_prot is None else 100*post_prot:.1f} "
-        f"%mid={None if stats.get('frac_mid') is None else 100*stats['frac_mid']:.1f} "
-        f"%~0={None if stats.get('frac_near_zero') is None else 100*stats['frac_near_zero']:.1f} "
+        f"[confirm] post-task M: %hi={hi_display} "
+        f"%mid={mid_display} %~0={near_zero_display} "
         f"hard={'Y' if hard else 'n'} mass={mass['mass_split_note']} "
         f"drift={'na' if prot_drift is None else f'{prot_drift:.3f}'} "
         f"=> {'CONFIRMED' if confirmed else 'NOT CONFIRMED'}",
