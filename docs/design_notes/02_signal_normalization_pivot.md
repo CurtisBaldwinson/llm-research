@@ -161,9 +161,14 @@ Commands:
 
     make run-parallel-calib BENCH=trace GPU=A40 CLOUD=SECURE
     make merge-calib
-    # after post-1-epoch-task0 confirmation:
-    make run-bg BENCH=trace GPU=A40 CLOUD=SECURE \
-      EXTRA_FLAGS='--extra-args --signal-tuning-json lab_reports/_staging/signal_tuning.json'
+    # after post-1-epoch-task0 confirmation clears confirmation_required:
+    #   signal_tuning.json already lives at benchmarks/trace/ (uploaded to the
+    #   pod by push_code) and is on the mechanism-arm AUTO-LOAD path, so the
+    #   scored run needs NO flag -- confirmed tuning autowires:
+    make run-bg BENCH=trace GPU=A40 CLOUD=SECURE
+    #   (to point at it explicitly, use the in-bench path that actually ships --
+    #    NOT lab_reports/_staging/, which is never uploaded to the pod:
+    #    EXTRA_FLAGS='--extra-args --signal-tuning-json benchmarks/trace/signal_tuning.json')
 
 ## Results — 2026-07-25 init-signal calibration run (and a salvage)
 

@@ -37,6 +37,7 @@ not a baseline to standardize onto EWC accumulation.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from baselines.base import Arm, DegenerateSignalError
 
@@ -84,7 +85,30 @@ def load_signal_tuning(path=None) -> dict:
     return {}
 
 
-def _apply_signal_tuning(arm, tuning: dict, allow_unconfirmed: bool = False) -> None:
+def _loaded_from_env(tuning: dict) -> bool:
+    """True iff this tuning dict was selected via SYNTH_SIGNAL_TUNING.
+
+    An env-selected file is an EXPLICIT request (per _apply_signal_tuning's
+    contract) and must hard-raise on unconfirmed, not be silently skipped like a
+    filesystem auto-load. We compare the loader's resolved ``_loaded_from``
+    against the resolved env path so a relative env value still matches.
+    """
+    if not tuning:
+        return False
+    env = os.environ.get("SYNTH_SIGNAL_TUNING")
+    if not env:
+        return False
+    loaded = tuning.get("_loaded_from")
+    if not loaded:
+        return False
+    try:
+        return Path(env).resolve() == Path(loaded).resolve()
+    except Exception:
+        return False
+
+
+def _apply_signal_tuning(arm, tuning: dict, allow_unconfirmed: bool = False,
+                         on_autoload: bool = False) -> None:
     """Overwrite alpha/beta/ema_window from calib recommendation when present.
 
     SAFETY GATE (DN02 "measured != selectable"): a signal_tuning.json produced
@@ -94,11 +118,42 @@ def _apply_signal_tuning(arm, tuning: dict, allow_unconfirmed: bool = False) -> 
     already gates *writing* the file behind --allow-unconfirmed, and this closes
     the same gap at the *consumption* point. Set env SM_ALLOW_UNCONFIRMED_TUNING=1
     or pass allow_unconfirmed=True to intentionally use unconfirmed tuning.
+
+    AUTO-LOAD vs EXPLICIT (fixes the regression flagged in the 2026-07-25 review):
+    the confirmation file must live under benchmarks/trace/ so the dispatcher
+    uploads it to the pod -- but that dir is ALSO the silent auto-load search
+    path. Hard-raising on auto-load therefore broke *every* default mechanism-arm
+    run (GradientAlignedMArm() with no flags). Resolution: distinguish intent.
+      * on_autoload=True  (silent filesystem pickup, no explicit request):
+            unconfirmed -> WARN and KEEP DEFAULTS (do not apply, do not raise).
+            A real run can never be silently shaped by unconfirmed tuning; it
+            simply runs on built-in defaults until the flag is cleared.
+      * on_autoload=False (explicit --signal-tuning-json / signal_tuning= dict /
+            env request): unconfirmed -> hard-raise as before (the one case that
+            must never be silent -- someone explicitly asked for this file).
+    Confirmed files (confirmation_required=false) auto-adopt in BOTH paths, so
+    autowire keeps working the moment confirmation clears the flag.
     """
     if not tuning:
         return
     needs_conf = bool(tuning.get("confirmation_required", False))
     env_ok = os.environ.get("SM_ALLOW_UNCONFIRMED_TUNING", "") == "1"
+    # Silent auto-load of an unconfirmed file: never contaminate a real run --
+    # skip the tuning, keep defaults, and warn loudly. (Explicit override via
+    # allow_unconfirmed/env still applies below.)
+    if needs_conf and on_autoload and not (allow_unconfirmed or env_ok):
+        src = tuning.get("_loaded_from", "<unknown>")
+        print(
+            "[arm] WARNING: found UNCONFIRMED signal tuning on the auto-load "
+            f"path ({src}, confirmation_required=true). KEEPING BUILT-IN "
+            "DEFAULTS for this run -- unconfirmed calibration will not shape a "
+            "scored run. Run `make confirm-tuning` to clear the flag, or set "
+            "SM_ALLOW_UNCONFIRMED_TUNING=1 to intentionally auto-adopt it.",
+            flush=True,
+        )
+        arm._signal_tuning_source = None
+        arm._signal_tuning_confirmed = False
+        return
     if needs_conf and not (allow_unconfirmed or env_ok):
         src = tuning.get("_loaded_from", "<unknown>")
         raise RuntimeError(
@@ -139,14 +194,25 @@ class _SignalRegArmBase(Arm):
         self._consolidation_mode = "task_boundary_isolation_screen"
         self.ema_window = int(kw.get("ema_window", _DEFAULT_EMA_WINDOW))
         self._signal_tuning_source = None
-        # Optional explicit dict from harness; else try load_signal_tuning().
-        st = kw.get("signal_tuning")
-        if st is None and kw.get("signal_tuning_json"):
+        # Tuning can arrive three ways; only the last is a SILENT auto-load.
+        # We track which so _apply_signal_tuning can be lenient on auto-load and
+        # strict on explicit requests (see its docstring / 2026-07-25 review).
+        st = kw.get("signal_tuning")                       # explicit dict
+        explicit = st is not None
+        if st is None and kw.get("signal_tuning_json"):    # explicit path
             st = load_signal_tuning(kw.get("signal_tuning_json"))
-        elif st is None and kw.get("load_signal_tuning", True):
+            explicit = True
+        elif st is None and kw.get("load_signal_tuning", True):  # loader chain
             st = load_signal_tuning()
+            # The loader chain includes SYNTH_SIGNAL_TUNING (an EXPLICIT request
+            # per the gate contract) *and* silent filesystem auto-load paths.
+            # Only the latter should get the lenient on_autoload treatment: an
+            # env-selected file must hard-raise on unconfirmed like any other
+            # explicit request. Detect env selection by matching the resolved
+            # _loaded_from against SYNTH_SIGNAL_TUNING.
+            explicit = _loaded_from_env(st)
         if st:
-            _apply_signal_tuning(self, st)
+            _apply_signal_tuning(self, st, on_autoload=not explicit)
 
     def on_train_start(self, model) -> None:
         from synthetic_myelination import (

@@ -926,7 +926,12 @@ def _bt_mass_split_health(stats: Dict) -> Dict:
 
 
 DEFAULT_CALIB_TAUS = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70]
-DEFAULT_CALIB_EMA_WINDOWS = [1, 5, 15, 40, 80]
+# w=80 dropped from the DEFAULT grid (2026-07-25 review): even with the
+# _CALIB_STEPS_HARD_CAP it is the single most expensive window (~35% of calib
+# steps/task) AND is non-adoptable (> MAX_ADOPTABLE_EMA_WINDOW, see below), so
+# it costs measurement budget for a point that can never win. It stays fully
+# supported as an opt-in probe: `--ema-windows 1 5 15 40 80`.
+DEFAULT_CALIB_EMA_WINDOWS = [1, 5, 15, 40]
 # Pre-registered protected-fraction frontier endpoints (DN02).
 PROTECTED_FRAC_TARGETS = [0.05, 0.10, 0.20, 0.40]
 # Over-smoothing guard (data-grounded, DN02): an EMA window is only trustworthy
@@ -934,7 +939,8 @@ PROTECTED_FRAC_TARGETS = [0.05, 0.10, 0.20, 0.40]
 # 1 epoch over n_train=5000 examples at batch_size=8 => ~625 steps/task
 # (trace_data.build_trace_sequence n_train=5000; run.py epochs=1, batch_size=8).
 # Adoptable iff window <= ~10% of that budget (~62 steps): w in {1,5,15,40} pass
-# (w=40 ~= 6.4% of a task). w=80 (~12.8%) is measured + mapped + on the frontier
+# (w=40 ~= 6.4% of a task). w=80 (~12.8%) is NOT in the default grid anymore
+# (opt-in via --ema-windows); when probed it is mapped + on the frontier
 # plot for curiosity/boundary behavior, but never selectable as a default-arm or
 # EMA-on winner, because a large window mechanically shrinks protected_frac_std
 # and would let the recommender adopt an over-smoothing artifact, not a better
@@ -1465,7 +1471,12 @@ def write_signal_tuning_json(recommended: Dict, alpha: float, path: Path) -> Pat
 # arm-side gate (_apply_signal_tuning) refuses to apply it until this cell
 # clears the flag.
 #
-# This cell is deliberately cheap: it trains ONLY task 0 for --epochs epochs
+# This cell is deliberately LIGHTWEIGHT RELATIVE TO A FULL RUN (not "laptop
+# cheap": it still trains ONE full task-0 epoch of Llama-3.2-3B, ~625 steps,
+# plus a measure phase of _calib_steps_for_window(150, w) = max(150, 10*w)
+# steps -- i.e. >=150, scaling with the selected EMA window (150 at the
+# recommended w=1; 400 at w=40) -- a few minutes on an A40, not something to run
+# on a laptop). It trains ONLY task 0 for --epochs epochs
 # (default 1), then measures M ONCE at the single recommended (tau*, w*, beta*)
 # point -- not the whole grid. It reuses the exact same measurement path as
 # calibrate_signal (MyelinState -> _accumulate_signal_into_M -> _bt_m_stats ->
@@ -1733,7 +1744,9 @@ def main():
     ap.add_argument("--taus", type=float, nargs="+", default=None,
                     help="break-even thresholds (default 0.1..0.7).")
     ap.add_argument("--ema-windows", type=int, nargs="+", default=None,
-                    help="EMA windows to sweep (default 1 5 15 40 80).")
+                    help="EMA windows to sweep (default 1 5 15 40; w=80 is a "
+                         "non-adoptable opt-in probe, add it explicitly to "
+                         "measure the over-smoothing boundary).")
     ap.add_argument("--calib-alpha", type=float, default=0.1,
                     help="alpha held fixed while beta sets the break-even.")
     ap.add_argument("--calib-steps", type=int, default=150,

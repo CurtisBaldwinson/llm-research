@@ -213,8 +213,9 @@ merge-calib:
 ## Confirm calibrated signal tuning against post-1-epoch-task0 M (DN02).
 ## Trains task 0 for 1 epoch on a GPU, measures M at the recommended
 ## (tau,w,beta), and clears confirmation_required iff the post-task mass
-## split stays healthy. Cheap: single point, single task. Dispatches to
-## the same cloud path as `make run`; results land back in _staging.
+## split stays healthy. Lightweight vs a full run (one task-0 epoch of a 3B
+## model + one measure point, a few min on an A40 -- not a laptop job).
+## Dispatches to the same cloud path as `make run`; results land in _staging.
 ## Usage: make confirm-tuning BENCH=trace [GPU=A40] [CLOUD=SECURE] [SIGNAL_TUNING=...]
 .PHONY: confirm-tuning
 confirm-tuning: key-$(PROVIDER)

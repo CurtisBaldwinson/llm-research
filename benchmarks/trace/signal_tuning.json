@@ -8,7 +8,7 @@
   "ema_window": 1,
   "normalization": "rank",
   "protected_frac_mean": 0.55075,
-  "protected_frac_std": 0.002222048604328896,
+  "protected_frac_std": 0.0022,
   "confirmation_required": true,
   "confirmation_note": "Init-signal only. Run a post-1-epoch-task0 confirmation cell before treating these as locked arm defaults."
 }
