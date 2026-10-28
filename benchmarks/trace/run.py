@@ -529,7 +529,14 @@ def run(mode: str, arms: List[str], seeds: List[int], lambdas: List[float],
     def _arm_points(arm_name):
         if arm_name in BASELINE_SWEEPS:
             knob, grid = BASELINE_SWEEPS[arm_name]
-            return [(str(v), lambdas[0], (knob, v)) for v in grid]
+            values = [float(v) for v in grid]
+            tuned = tuning.get(f"{arm_name}_{knob}")
+            if tuned is not None and not any(
+                abs(float(tuned) - v) < 1e-9 for v in values
+            ):
+                values.append(float(tuned))
+            values.sort()
+            return [(str(v), lambdas[0], (knob, v)) for v in values]
         if arm_name in LAMBDA_INVARIANT_ARMS:
             return [(str(lambdas[0]), lambdas[0], None)]
         return [(str(l), l, None) for l in lambdas]

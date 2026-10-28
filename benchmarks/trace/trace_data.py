@@ -2,7 +2,8 @@
 
 TRACE (Wang et al., 2024; https://github.com/BeyonderXX/TRACE) is the
 standard continual-learning-for-LLMs benchmark. It is an 8-task sequence,
-trained in a FIXED order, 5,000 train / 2,000 test examples per task, all
+trained in a FIXED order, 5,000 training examples per task and non-uniform
+held-out test counts (evaluation caps at 2,000 examples per task), all
 standardized to a unified JSON format where each record is:
 
     {"prompt": "...", "answer": "..."}
@@ -291,11 +292,22 @@ def build_trace_sequence(
     return sequence
 
 
-def build_real_model(model_id: str, device: str, lora: bool = True):
+def build_real_model(model_id: str, device: str, lora: bool = True,
+                     attn_implementation: str | None = None):
     """Load the real base model + tokenizer, optionally with LoRA adapters.
 
     Mirrors the v1 07_gradient_aligned_m conventions: bf16, device_map, LoRA
     on the standard Llama attention+MLP projections. Returns (model, tokenizer).
+
+    attn_implementation: if given (e.g. "eager", "sdpa", "flash_attention_2"),
+        forwarded to from_pretrained. Default None preserves the prior behavior
+        exactly (transformers picks its default, i.e. SDPA on this stack), so
+        every existing caller is byte-for-byte unchanged. "eager" is used by the
+        Batch 2 equivalence preflight because it computes attention without the
+        tile/shape-dependent float reordering of the fused SDPA/Flash kernels,
+        which can reduce shape-dependent numerical differences. The preflight
+        must still verify equivalence on the actual model and execution stack;
+        selecting a backend alone does not establish output preservation.
     """
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -304,10 +316,18 @@ def build_real_model(model_id: str, device: str, lora: bool = True):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
+    _from_pretrained_kwargs = dict(
         torch_dtype=torch.bfloat16,
         device_map=device,
+    )
+    # Only pass attn_implementation when explicitly requested, so the default
+    # (None) path is identical to the prior code -- no behavior change for any
+    # existing caller.
+    if attn_implementation is not None:
+        _from_pretrained_kwargs["attn_implementation"] = attn_implementation
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        **_from_pretrained_kwargs,
     )
 
     if lora:

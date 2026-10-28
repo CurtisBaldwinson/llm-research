@@ -237,6 +237,15 @@ def main():
     ap.add_argument("--n_probe_tasks", type=int, default=2,
                     help="sort_eval: number of eval loaders to check")
     ap.add_argument("--device", type=str, default="cuda")
+    ap.add_argument("--attn-impl", dest="attn_impl", type=str, default=None,
+                    help=("attention implementation forwarded to the model "
+                          "loader (e.g. eager, sdpa, flash_attention_2). "
+                          "Default None = transformers default (SDPA on this "
+                          "stack). Use eager to test width-invariant attention "
+                          "so padding-crop / length-sort can be numerically "
+                          "output-preserving. The chosen backend is recorded "
+                          "in the artifact; a scored run enabling the Batch 2 "
+                          "transforms must load with the SAME backend."))
     ap.add_argument("--only", choices=["crop", "sort_eval"], default=None,
                     help="run only one check (default: both)")
     ap.add_argument("--out", type=Path, default=None,
@@ -253,7 +262,32 @@ def main():
     from run import evaluate
 
     print(f"[preflight] loading real model: {args.model_id}", flush=True)
-    model, tokenizer = build_real_model(args.model_id, args.device, lora=True)
+    model, tokenizer = build_real_model(args.model_id, args.device, lora=True,
+                                        attn_implementation=args.attn_impl)
+
+    def _resolved_attn_impl(m) -> str:
+        """Read the attention backend actually selected by the loader.
+
+        Recorded in the artifact so provenance reflects what RAN, not just what
+        was requested (CodeRabbit 2026-07-28): when --attn-impl is omitted the
+        request is None/"default" but transformers still picks a concrete
+        backend (SDPA on this stack). Backend equality must be checked separately;
+        the scored-run gate does not currently enforce it. PEFT wraps
+        the base model, so unwrap before reading config._attn_implementation.
+        """
+        base = getattr(m, "base_model", m)
+        base = getattr(base, "model", base)
+        cfg = getattr(base, "config", None) or getattr(m, "config", None)
+        for attr in ("_attn_implementation", "attn_implementation"):
+            val = getattr(cfg, attr, None)
+            if val:
+                return str(val)
+        return "unknown"
+
+    resolved_attn_impl = _resolved_attn_impl(model)
+    print(f"[preflight] attn_implementation requested="
+          f"{args.attn_impl or '(default)'} resolved={resolved_attn_impl}",
+          flush=True)
     pad_token_id = tokenizer.pad_token_id
 
     print(f"[preflight] building real TRACE sequence "
@@ -308,6 +342,8 @@ def main():
         "batch_size": args.batch_size,
         "max_len": args.max_len,
         "device": args.device,
+        "attn_implementation_requested": args.attn_impl or "default",
+        "attn_implementation_resolved": resolved_attn_impl,
         "checks": checks,
         "gate_note": (
             "run.py's _check_batch2_preflight requires passed=true, a matching "

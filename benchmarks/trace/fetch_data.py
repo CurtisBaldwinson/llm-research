@@ -21,7 +21,7 @@ canonical 5,000-example variant, verifies the exact per-task record counts, and
 normalizes the result to:
 
     <data_root>/TRACE/<Task>/train.json     (5000 records)
-    <data_root>/TRACE/<Task>/test.json      (2000 records, held-out eval)
+    <data_root>/TRACE/<Task>/test.json      (nonempty, per-task held-out counts)
 
 so benchmarks/trace/trace_data.py can load it directly. It also records the
 SHA-256 of the downloaded archive and a per-task record-count manifest to
@@ -57,19 +57,36 @@ TRACE_TASKS = [
 
 # --- Dataset-variant pinning (Claim 1 fix) -------------------------------
 # The archive ships several size variants of the TRACE split. We pin the
-# canonical full-size variant: 5,000 train + 2,000 test examples per task,
-# exactly as reported in TRACE (Wang et al., 2024, Table 1) and matching this
-# project's registered design (run.py: n_train=5000, n_eval=2000).
+# canonical full-size variant by its TRAIN size: 5,000 train examples per task
+# (the real, uniform discriminator between the _5000 / _1000 / _500 variants),
+# matching this project's registered design (run.py / trace_data.py:
+# n_train=5000).
+#
+# TEST counts are deliberately NOT asserted against a uniform expectation.
+# TRACE's held-out test sets are per-task and non-uniform (e.g. FOMC 496,
+# MeetingBank 692, 20Minuten 200, NumGLUE-cm 81, NumGLUE-ds 325); there is no
+# canonical "2,000 test each". The eval consumer in trace_data.py takes
+# records[:n_eval] (a CAP, not a requirement -- see _tokenize_examples), so a
+# task with fewer test records is valid and simply evaluates on all it has.
+# CHANGED 2026-07-26: a prior EXPECTED_TEST_COUNT=2000 assertion was rejecting
+# the correct full-size variant (train=5000 passed for every task; only the
+# fabricated uniform test expectation failed). We now assert train==5000 and
+# test>=MIN_TEST_COUNT (>0), and record the ACTUAL per-task test counts in the
+# manifest/provenance for honest logs. Wrong-variant detection is preserved by
+# the train==5000 check (the small variants ship 500/1000 train, not 5000).
 #
 # We identify the correct variant by a substring token that appears in the
 # variant directory name. If the archive layout ever changes and no directory
 # matches this token, we do NOT silently fall back to another variant -- we
 # fail loudly (see _pin_variant_root). The definitive guarantee is the
-# record-count assertion in _assert_record_counts, which rejects any variant
-# whose per-task counts don't match EXPECTED_* below regardless of naming.
+# train-count assertion in _assert_record_counts, which rejects any variant
+# whose per-task train counts don't match EXPECTED_TRAIN_COUNT regardless of
+# naming.
 VARIANT_DIR_TOKEN = "LLM-CL-Benchmark_5000"
 EXPECTED_TRAIN_COUNT = 5000
-EXPECTED_TEST_COUNT = 2000
+# Minimum acceptable held-out test records per task (>0). NOT a uniform target;
+# see the note above on why per-task test counts vary.
+MIN_TEST_COUNT = 1
 
 
 def _already_staged(trace_dir: Path) -> bool:
@@ -183,11 +200,18 @@ def _find_task_dirs(variant_root: Path) -> dict:
 
 
 def _assert_record_counts(trace_dir: Path) -> dict:
-    """Hard-verify each staged task has EXACTLY the expected record counts.
+    """Verify each staged task is the canonical full-size variant.
 
-    This is the definitive guard against staging the wrong-size variant
-    (Claim 1). Returns a {task: {"train": n, "test": m}} manifest. Raises on
-    any mismatch.
+    Variant guard = TRAIN count. We assert train == EXPECTED_TRAIN_COUNT
+    (5,000), which is the real, uniform discriminator between the archive's
+    _5000 / _1000 / _500 variants. TEST counts are per-task and non-uniform in
+    TRACE, and the eval path caps at records[:n_eval], so we only require
+    test >= MIN_TEST_COUNT (>0) and RECORD the actual per-task test counts in
+    the returned manifest (for honest provenance logs) rather than asserting a
+    fabricated uniform target. See the module-level note dated 2026-07-26.
+
+    Returns a {task: {"train": n, "test": m}} manifest. Raises on any train
+    mismatch or an empty test split.
     """
     manifest = {}
     errors = []
@@ -199,21 +223,53 @@ def _assert_record_counts(trace_dir: Path) -> dict:
         if n_train != EXPECTED_TRAIN_COUNT:
             errors.append(
                 f"{task}: train.json has {n_train} records, "
-                f"expected {EXPECTED_TRAIN_COUNT}"
+                f"expected {EXPECTED_TRAIN_COUNT} (wrong-size variant?)"
             )
-        if n_test != EXPECTED_TEST_COUNT:
+        if n_test < MIN_TEST_COUNT:
             errors.append(
                 f"{task}: test.json has {n_test} records, "
-                f"expected {EXPECTED_TEST_COUNT}"
+                f"expected >= {MIN_TEST_COUNT} (empty/missing held-out split)"
             )
     if errors:
         raise RuntimeError(
-            "TRACE record-count verification FAILED -- the staged data does not "
-            "match the canonical 5,000-train / 2,000-test variant. This almost "
-            "certainly means the wrong size variant was staged.\n  "
+            "TRACE variant verification FAILED -- the staged data is not the "
+            "canonical 5,000-train variant (or a task has an empty test split). "
+            "Per-task test counts vary by design and are NOT asserted against a "
+            "uniform target; see fetch_data's module-level note.\n  "
             + "\n  ".join(errors)
         )
     return manifest
+
+
+def _write_provenance(trace_dir: Path, manifest: dict,
+                      archive_sha256: str | None = None,
+                      variant_root_str: str | None = None) -> None:
+    """Write _provenance.json in the CURRENT schema.
+
+    Called from BOTH the full-staging path and the already-staged fast path so
+    a rerun over a directory staged by an older version is migrated to the
+    current provenance schema rather than left with stale metadata
+    (CodeRabbit 2026-07-28). On the fast path nothing was downloaded, so
+    archive_sha256 / pinned_variant_root are unknown; we record an explicit
+    sentinel instead of a stale value.
+    """
+    provenance = {
+        "gdrive_id": TRACE_GDRIVE_ID,
+        "archive_sha256": archive_sha256 if archive_sha256 is not None
+            else "unknown (fast-path rerun; archive not re-downloaded)",
+        "pinned_variant_token": VARIANT_DIR_TOKEN,
+        "pinned_variant_root": variant_root_str if variant_root_str is not None
+            else "unknown (fast-path rerun; archive not re-extracted)",
+        "expected_train_count": EXPECTED_TRAIN_COUNT,
+        "min_test_count": MIN_TEST_COUNT,
+        "test_counts_note": (
+            "per-task test counts vary by design; actual counts recorded in "
+            "record_counts below (not asserted against a uniform target)"
+        ),
+        "record_counts": manifest,
+    }
+    with open(trace_dir / "_provenance.json", "w", encoding="utf-8") as f:
+        json.dump(provenance, f, indent=2, sort_keys=True)
 
 
 def stage_trace(data_root: Path) -> Path:
@@ -224,8 +280,18 @@ def stage_trace(data_root: Path) -> Path:
     if _already_staged(trace_dir):
         # Even when already staged, re-verify counts so a previously-staged
         # WRONG variant can't slip through on a re-run.
-        _assert_record_counts(trace_dir)
-        print(f"[fetch_data] TRACE already staged + verified at {trace_dir}; skipping.")
+        manifest = _assert_record_counts(trace_dir)
+        # Rewrite provenance in the current schema so a directory staged by an
+        # older version doesn't retain stale/missing metadata (CodeRabbit).
+        _write_provenance(trace_dir, manifest)
+        test_counts_str = ", ".join(
+            f"{task}:{manifest[task]['test']}" for task in TRACE_TASKS
+        )
+        print(
+            f"[fetch_data] TRACE already staged + verified at {trace_dir}; "
+            f"skipping download (per-task test counts [{test_counts_str}]); "
+            f"provenance refreshed."
+        )
         return trace_dir
 
     trace_dir.mkdir(parents=True, exist_ok=True)
@@ -278,22 +344,17 @@ def stage_trace(data_root: Path) -> Path:
         variant_root_str = str(variant_root.relative_to(scratch))
     except ValueError:
         variant_root_str = str(variant_root)
-    provenance = {
-        "gdrive_id": TRACE_GDRIVE_ID,
-        "archive_sha256": archive_sha256,
-        "pinned_variant_token": VARIANT_DIR_TOKEN,
-        "pinned_variant_root": variant_root_str,
-        "expected_train_count": EXPECTED_TRAIN_COUNT,
-        "expected_test_count": EXPECTED_TEST_COUNT,
-        "record_counts": manifest,
-    }
-    with open(trace_dir / "_provenance.json", "w", encoding="utf-8") as f:
-        json.dump(provenance, f, indent=2, sort_keys=True)
+    _write_provenance(trace_dir, manifest, archive_sha256=archive_sha256,
+                      variant_root_str=variant_root_str)
 
+    test_counts_str = ", ".join(
+        f"{task}:{manifest[task]['test']}" for task in TRACE_TASKS
+    )
     print(
         f"[fetch_data] TRACE staged + verified: {trace_dir} "
-        f"({len(TRACE_TASKS)} tasks, {EXPECTED_TRAIN_COUNT} train / "
-        f"{EXPECTED_TEST_COUNT} test each). Provenance -> {trace_dir/'_provenance.json'}."
+        f"({len(TRACE_TASKS)} tasks, {EXPECTED_TRAIN_COUNT} train each; "
+        f"per-task test counts [{test_counts_str}]). "
+        f"Provenance -> {trace_dir/'_provenance.json'}."
     )
     return trace_dir
 
